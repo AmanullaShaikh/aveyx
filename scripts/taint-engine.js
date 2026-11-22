@@ -316,7 +316,7 @@ export function isGuardedByDominatingBranch(callPath, targetNode) {
           if (['isUUID', 'isInt', 'isNumeric', 'isAlphanumeric', 'isInteger', 'isFinite'].includes(fn)) {
             guarded = true;
           }
-          if (fn === 'test' && tn.callee?.object?.type === 'RegExpLiteral' && /^\^[\w\\d0-9a-zA-Z_-]+\+\$/.test(tn.callee.object.pattern)) {
+          if (fn === 'test' && tn.callee?.object?.type === 'RegExpLiteral' && /^\^(?:\\d|\\w|\[[0-9a-zA-Z_-]+\])\+\$$/.test(tn.callee.object.pattern)) {
             guarded = true;
           }
         }

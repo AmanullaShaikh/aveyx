@@ -242,7 +242,7 @@ export function resolveImportPath(sourceFile, importString, rootDir, tsConfig = 
       }
       if (matched) {
         for (const target of rule.targets) {
-          const mapped = rule.hasStar ? target.replace("*", wildcard) : target;
+          const mapped = rule.hasStar ? target.split("*").join(wildcard) : target;
           const candidateAbs = path.resolve(cfg.baseDir, mapped);
           const hit = tryResolveFileOnDisk(candidateAbs, rootDir);
           if (hit) return { type: 'internal', path: hit };
