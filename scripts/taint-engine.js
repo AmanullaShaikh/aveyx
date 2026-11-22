@@ -1,0 +1,635 @@
+import { parse } from '@babel/parser';
+import _traverse from '@babel/traverse';
+
+const traverse = _traverse.default || _traverse;
+
+const SANITIZER_CALLEES = new Set([
+  'parseInt', 'Number', 'parseFloat', 'BigInt', 'Boolean',
+  'encodeURIComponent', 'encodeURI', 'escapeHtml', 'escape', 'basename'
+]);
+
+const SANITIZER_MEMBERS = new Set([
+  'path.basename', 'DOMPurify.sanitize', 'validator.escape', 'validator.toInt',
+  'validator.isUUID', 'he.encode', 'xss'
+]);
+
+const TAINT_SOURCE_ROOTS = new Set(['req', 'request', 'ctx']);
+const TAINT_SOURCE_PROPS = new Set(['body', 'query', 'params', 'headers', 'cookies']);
+
+function getMemberChain(node) {
+  const parts = [];
+  let cur = node;
+  while (cur) {
+    if (cur.type === 'Identifier') {
+      parts.unshift(cur.name);
+      break;
+    }
+    if (cur.type === 'MemberExpression') {
+      const prop = cur.property?.name || cur.property?.value;
+      if (!prop) return null;
+      parts.unshift(String(prop));
+      cur = cur.object;
+    } else {
+      return null;
+    }
+  }
+  return parts;
+}
+
+export function isSanitizerCall(node) {
+  if (!node || node.type !== 'CallExpression') return false;
+  if (node.callee.type === 'Identifier' && SANITIZER_CALLEES.has(node.callee.name)) {
+    return true;
+  }
+  if (node.callee.type === 'MemberExpression') {
+    const chain = getMemberChain(node.callee);
+    if (chain) {
+      const joined = chain.join('.');
+      if (SANITIZER_MEMBERS.has(joined)) return true;
+      const last = chain[chain.length - 1];
+      if (last === 'basename' && chain[0] === 'path') return true;
+      if (last === 'sanitize' || last === 'safeParse') return true;
+      // Schema validation sanitizers: schema.parse(x), z.string().parse(x), userSchema.parse(x)
+      if (last === 'parse' && /(?:schema|zod|validator|z)$/i.test(chain[chain.length - 2] || '')) return true;
+    }
+    if (node.callee.property?.name === 'parse' && node.callee.object?.type === 'CallExpression') {
+      const innerChain = getMemberChain(node.callee.object.callee);
+      if (innerChain && (innerChain[0] === 'z' || innerChain[0] === 'zod' || innerChain[0] === 'yup')) return true;
+    }
+  }
+  return false;
+}
+
+export function isDirectTaintSource(node) {
+  if (!node) return false;
+  if (node.type === 'MemberExpression') {
+    const chain = getMemberChain(node);
+    if (!chain || chain.length < 2) return false;
+    if (TAINT_SOURCE_ROOTS.has(chain[0]) && TAINT_SOURCE_PROPS.has(chain[1])) return true;
+    if (chain[0] === 'ctx' && chain[1] === 'request' && TAINT_SOURCE_PROPS.has(chain[2])) return true;
+    if (chain[0] === 'process' && chain[1] === 'argv') return true;
+  }
+  if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression') {
+    const chain = getMemberChain(node.callee);
+    if (chain && chain[chain.length - 1] === 'get' && /searchParams/i.test(chain.join('.'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getFnNodeFromPath(p) {
+  if (p.isFunctionDeclaration()) return { name: p.node.id?.name, fn: p.node };
+  if (p.isVariableDeclarator() && p.node.id?.type === 'Identifier') {
+    const init = p.node.init;
+    if (init && (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression')) {
+      return { name: p.node.id.name, fn: init };
+    }
+  }
+  return null;
+}
+
+function exprUsesParamOrSource(node, paramIndexMap, fnMap, visited = new Set(), scope = null) {
+  if (!node) return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
+  if (node.type === 'AwaitExpression') {
+    return exprUsesParamOrSource(node.argument, paramIndexMap, fnMap, visited, scope);
+  }
+  if (isSanitizerCall(node)) return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
+  if (isDirectTaintSource(node)) return { fromSource: true, fromParams: new Set(), hasSqlConcat: false };
+
+  if (node.type === 'Identifier') {
+    if (paramIndexMap.has(node.name)) {
+      return { fromSource: false, fromParams: new Set([paramIndexMap.get(node.name)]), hasSqlConcat: false };
+    }
+    if (visited.has(node.name)) return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
+    visited.add(node.name);
+    const binding = scope?.getBinding(node.name);
+    if (binding?.path?.node?.init) {
+      return exprUsesParamOrSource(binding.path.node.init, paramIndexMap, fnMap, visited, binding.scope);
+    }
+    return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
+  }
+
+  if (node.type === 'MemberExpression') {
+    const rootChain = getMemberChain(node);
+    if (rootChain && paramIndexMap.has(rootChain[0])) {
+      return { fromSource: false, fromParams: new Set([paramIndexMap.get(rootChain[0])]), hasSqlConcat: false };
+    }
+    return exprUsesParamOrSource(node.object, paramIndexMap, fnMap, visited, scope);
+  }
+
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const l = exprUsesParamOrSource(node.left, paramIndexMap, fnMap, visited, scope);
+    const r = exprUsesParamOrSource(node.right, paramIndexMap, fnMap, visited, scope);
+    const strHint = (node.left.type === 'StringLiteral' && /\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(node.left.value)) ||
+      (node.right.type === 'StringLiteral' && /\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(node.right.value));
+    return {
+      fromSource: l.fromSource || r.fromSource,
+      fromParams: new Set([...l.fromParams, ...r.fromParams]),
+      hasSqlConcat: l.hasSqlConcat || r.hasSqlConcat || (strHint && (l.fromParams.size > 0 || r.fromParams.size > 0 || l.fromSource || r.fromSource))
+    };
+  }
+
+  if (node.type === 'TemplateLiteral') {
+    let fromSource = false;
+    const fromParams = new Set();
+    let hasSqlConcat = false;
+    const rawText = node.quasis.map(q => q.value.raw).join(' ');
+    const sqlHint = /\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(rawText);
+    for (const ex of node.expressions || []) {
+      const sub = exprUsesParamOrSource(ex, paramIndexMap, fnMap, visited, scope);
+      if (sub.fromSource) fromSource = true;
+      for (const idx of sub.fromParams) fromParams.add(idx);
+      if (sub.hasSqlConcat || (sqlHint && (sub.fromSource || sub.fromParams.size > 0))) hasSqlConcat = true;
+    }
+    return { fromSource, fromParams, hasSqlConcat };
+  }
+
+  if (node.type === 'ConditionalExpression') {
+    const c = exprUsesParamOrSource(node.consequent, paramIndexMap, fnMap, visited, scope);
+    const a = exprUsesParamOrSource(node.alternate, paramIndexMap, fnMap, visited, scope);
+    return {
+      fromSource: c.fromSource || a.fromSource,
+      fromParams: new Set([...c.fromParams, ...a.fromParams]),
+      hasSqlConcat: c.hasSqlConcat || a.hasSqlConcat
+    };
+  }
+
+  if (node.type === 'CallExpression' && node.callee.type === 'Identifier') {
+    const calleeSum = fnMap.get(node.callee.name);
+    if (calleeSum) {
+      let fromSource = calleeSum.returnsSource;
+      const fromParams = new Set();
+      let hasSqlConcat = calleeSum.returnsSqlConcat;
+      for (const idx of calleeSum.paramToReturn) {
+        if (node.arguments[idx]) {
+          const argRes = exprUsesParamOrSource(node.arguments[idx], paramIndexMap, fnMap, visited, scope);
+          if (argRes.fromSource) fromSource = true;
+          for (const pIdx of argRes.fromParams) fromParams.add(pIdx);
+          if (argRes.hasSqlConcat) hasSqlConcat = true;
+        }
+      }
+      return { fromSource, fromParams, hasSqlConcat };
+    }
+  }
+
+  return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
+}
+
+export function summarizeFunctionTaints(ast) {
+  const summaries = new Map();
+  if (!ast) return summaries;
+
+  const fnEntries = [];
+  try {
+    traverse(ast, {
+      FunctionDeclaration(p) {
+        const info = getFnNodeFromPath(p);
+        if (info?.name) fnEntries.push({ ...info, scope: p.scope });
+      },
+      VariableDeclarator(p) {
+        const info = getFnNodeFromPath(p);
+        if (info?.name) fnEntries.push({ ...info, scope: p.scope });
+      }
+    });
+  } catch {
+    return summaries;
+  }
+
+  for (let pass = 0; pass < 2; pass++) {
+    for (const { name, fn, scope } of fnEntries) {
+      const paramIndexMap = new Map();
+      (fn.params || []).forEach((param, idx) => {
+        if (param.type === 'Identifier') paramIndexMap.set(param.name, idx);
+        else if (param.type === 'AssignmentPattern' && param.left?.type === 'Identifier') {
+          paramIndexMap.set(param.left.name, idx);
+        }
+      });
+
+      const paramToReturn = new Set();
+      let returnsSource = false;
+      let returnsSqlConcat = false;
+
+      if (fn.body?.type === 'BlockStatement') {
+        for (const stmt of fn.body.body) {
+          if (stmt.type === 'ReturnStatement' && stmt.argument) {
+            const res = exprUsesParamOrSource(stmt.argument, paramIndexMap, summaries, new Set(), scope);
+            if (res.fromSource) returnsSource = true;
+            if (res.hasSqlConcat) returnsSqlConcat = true;
+            for (const idx of res.fromParams) paramToReturn.add(idx);
+          }
+        }
+      } else if (fn.body) {
+        const res = exprUsesParamOrSource(fn.body, paramIndexMap, summaries, new Set(), scope);
+        if (res.fromSource) returnsSource = true;
+        if (res.hasSqlConcat) returnsSqlConcat = true;
+        for (const idx of res.fromParams) paramToReturn.add(idx);
+      }
+
+      summaries.set(name, { paramToReturn, returnsSource, returnsSqlConcat });
+    }
+  }
+
+  return summaries;
+}
+
+export function extractFileExportSummaries(code) {
+  try {
+    const ast = parse(code, {
+      sourceType: 'module',
+      plugins: ['typescript', 'jsx', 'classProperties', 'decorators-legacy', 'dynamicImport', 'exportDefaultFrom', 'exportNamespaceFrom', 'topLevelAwait', 'asyncGenerators']
+    });
+    return summarizeFunctionTaints(ast);
+  } catch {
+    return new Map();
+  }
+}
+
+function isNestedDestructuredFromTaint(binding) {
+  if (!binding?.path?.isVariableDeclarator()) return false;
+  const init = binding.path.node.init;
+  if (!init) return false;
+  if (isDirectTaintSource(init)) return true;
+  // Handle `const { body: { id } } = req;`
+  if (init.type === 'Identifier' && TAINT_SOURCE_ROOTS.has(init.name) && binding.path.node.id?.type === 'ObjectPattern') {
+    for (const prop of binding.path.node.id.properties || []) {
+      const k = prop.key?.name || prop.key?.value;
+      if (TAINT_SOURCE_PROPS.has(k)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Evaluates source -> sanitizer -> sink taint flows across intra-file and imported helpers.
+ * Detects: SQL_INJECTION, COMMAND_INJECTION, PATH_TRAVERSAL, SSRF, XSS, NOSQL_INJECTION, PROTOTYPE_POLLUTION.
+ */
+export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries = new Map()) {
+  const issues = [];
+  if (!ast) return issues;
+
+  const isTestFile = /\.(test|spec)\.[a-z]+$/i.test(filePath) || /(?:^|\/)tests\//i.test(filePath);
+  const namedFsFns = new Set();
+  try {
+    traverse(ast, {
+      ImportDeclaration(p) {
+        const src = p.node.source?.value || "";
+        if (src === "fs" || src === "node:fs" || src === "fs/promises" || src === "node:fs/promises") {
+          for (const spec of p.node.specifiers || []) {
+            if (spec.type === "ImportSpecifier") {
+              const orig = spec.imported?.name || spec.imported?.value;
+              if (["readFile", "readFileSync", "writeFile", "writeFileSync", "createReadStream"].includes(orig)) {
+                namedFsFns.add(spec.local.name);
+              }
+            }
+          }
+        }
+      }
+    });
+  } catch {}
+  const localSummaries = summarizeFunctionTaints(ast);
+  const allSummaries = new Map([...importedFnSummaries.entries(), ...localSummaries.entries()]);
+
+  function isExprTainted(node, scope, visited = new Set()) {
+    if (!node) return { tainted: false, sqlConcat: false };
+    if (node.type === 'AwaitExpression') return isExprTainted(node.argument, scope, visited);
+    if (isSanitizerCall(node)) return { tainted: false, sqlConcat: false };
+    if (isDirectTaintSource(node)) return { tainted: true, sqlConcat: false };
+
+    if (node.type === 'BinaryExpression' && node.operator === '+') {
+      const l = isExprTainted(node.left, scope, visited);
+      const r = isExprTainted(node.right, scope, visited);
+      return { tainted: l.tainted || r.tainted, sqlConcat: l.sqlConcat || r.sqlConcat };
+    }
+
+    if (node.type === 'TemplateLiteral') {
+      let tainted = false;
+      let sqlConcat = false;
+      for (const ex of node.expressions || []) {
+        const sub = isExprTainted(ex, scope, visited);
+        if (sub.tainted) tainted = true;
+        if (sub.sqlConcat) sqlConcat = true;
+      }
+      return { tainted, sqlConcat };
+    }
+
+    if (node.type === 'ConditionalExpression') {
+      const c = isExprTainted(node.consequent, scope, visited);
+      const a = isExprTainted(node.alternate, scope, visited);
+      return { tainted: c.tainted || a.tainted, sqlConcat: c.sqlConcat || a.sqlConcat };
+    }
+
+    if (node.type === 'Identifier') {
+      if (visited.has(node.name)) return { tainted: false, sqlConcat: false };
+      visited.add(node.name);
+      const binding = scope?.getBinding(node.name);
+      if (!binding) return { tainted: false, sqlConcat: false };
+
+      if (isNestedDestructuredFromTaint(binding)) {
+        return { tainted: true, sqlConcat: false };
+      }
+      if (binding.path?.node?.init) {
+        const initRes = isExprTainted(binding.path.node.init, binding.scope, visited);
+        if (initRes.tainted) return initRes;
+      }
+      for (const cv of binding.constantViolations || []) {
+        if (cv.isAssignmentExpression() && (cv.node.operator === '=' || cv.node.operator === '+=')) {
+          const cvRes = isExprTainted(cv.node.right, cv.scope, visited);
+          if (cvRes.tainted) return cvRes;
+        }
+      }
+      return { tainted: false, sqlConcat: false };
+    }
+
+    if (node.type === 'NewExpression' && node.callee?.type === 'Identifier' && node.callee.name === 'URL' && node.arguments?.[0]) {
+      return isExprTainted(node.arguments[0], scope, visited);
+    }
+
+    if (node.type === 'MemberExpression') {
+      return isExprTainted(node.object, scope, visited);
+    }
+
+    if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression') {
+      const mChain = getMemberChain(node.callee);
+      if (mChain && mChain[0] === 'path' && (mChain[1] === 'join' || mChain[1] === 'resolve')) {
+        for (const arg of node.arguments || []) {
+          const argRes = isExprTainted(arg, scope, visited);
+          if (argRes.tainted) return argRes;
+        }
+      }
+    }
+
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier') {
+      const sum = allSummaries.get(node.callee.name);
+      if (sum) {
+        if (sum.returnsSource) return { tainted: true, sqlConcat: sum.returnsSqlConcat };
+        for (const idx of sum.paramToReturn) {
+          if (node.arguments[idx]) {
+            const argRes = isExprTainted(node.arguments[idx], scope, visited);
+            if (argRes.tainted) return { tainted: true, sqlConcat: sum.returnsSqlConcat || argRes.sqlConcat };
+          }
+        }
+      }
+    }
+
+    return { tainted: false, sqlConcat: false };
+  }
+
+  try {
+    traverse(ast, {
+      CallExpression(p) {
+        const line = p.node.loc?.start?.line || 1;
+        const callee = p.node.callee;
+        const propName = callee.type === 'MemberExpression' ? (callee.property?.name || callee.property?.value) : null;
+        const objName = callee.type === 'MemberExpression' ? callee.object?.name : null;
+        const fnName = callee.type === 'Identifier' ? callee.name : null;
+
+        // 1. Inter-procedural Command Injection
+        if (!isTestFile && (fnName === 'exec' || fnName === 'execSync' || propName === 'exec' || propName === 'execSync')) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && arg0.type !== 'StringLiteral' && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'CRITICAL',
+              category: 'COMMAND_INJECTION',
+              type: 'COMMAND_INJECTION',
+              message: 'Inter-procedural taint flow: unsanitized user input reaches exec/execSync(). Sanitize or use execFile/spawn with static args.'
+            });
+          }
+        }
+
+        // 2. Path Traversal
+        if (
+          !isTestFile &&
+          ((objName === 'fs' && ['readFile', 'readFileSync', 'writeFile', 'writeFileSync', 'createReadStream'].includes(propName)) ||
+           (fnName && namedFsFns.has(fnName)) ||
+           (propName === 'sendFile' && ['res', 'reply'].includes(objName)))
+        ) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'CRITICAL',
+              category: 'PATH_TRAVERSAL',
+              type: 'PATH_TRAVERSAL',
+              message: `Inter-procedural taint flow: unsanitized user input reaches ${objName}.${propName}(). Normalize and restrict with path.basename() or root prefix check.`
+            });
+          }
+        }
+
+        // 3. SSRF
+        if (
+          !isTestFile &&
+          (fnName === 'fetch' || (objName === 'axios' && ['get', 'post', 'put', 'delete', 'request'].includes(propName)))
+        ) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'SSRF',
+              type: 'SSRF',
+              message: 'Inter-procedural taint flow: unsanitized user input controls outbound request URL (SSRF risk). Validate against an allowlist.'
+            });
+          }
+        }
+
+        // 4. Inter-procedural SQLi
+        if (propName && ['query', 'raw', '$queryRawUnsafe', '$executeRawUnsafe', 'execute'].includes(propName)) {
+          const arg0 = p.node.arguments[0];
+          if (arg0) {
+            const res = isExprTainted(arg0, p.scope);
+            if (res.tainted && res.sqlConcat) {
+              issues.push({
+                file: filePath,
+                line,
+                severity: 'CRITICAL',
+                category: 'SQL_INJECTION',
+                type: 'SQL_INJECTION',
+                message: 'Inter-procedural taint flow: unsanitized user input flows through helper into dynamic SQL query. Use parameterized queries.'
+              });
+            }
+          }
+        }
+
+        // 5. NoSQL Injection: collection.find(req.body) / User.findOne(req.query) / { $where: tainted }
+        if (!isTestFile && propName && ['find', 'findOne', 'findOneAndUpdate', 'deleteMany', 'updateMany'].includes(propName)) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && (isDirectTaintSource(arg0) || (arg0.type === 'Identifier' && isExprTainted(arg0, p.scope).tainted))) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'NOSQL_INJECTION',
+              type: 'NOSQL_INJECTION',
+              message: `Unsanitized request object passed directly into .${propName}() (NoSQL operator injection risk). Whitelist explicit fields or validate with Zod.`
+            });
+          } else if (arg0?.type === 'ObjectExpression') {
+            for (const prop of arg0.properties || []) {
+              const k = prop.key?.name || prop.key?.value;
+              if (k === '$where' && isExprTainted(prop.value, p.scope).tainted) {
+                issues.push({
+                  file: filePath,
+                  line,
+                  severity: 'CRITICAL',
+                  category: 'NOSQL_INJECTION',
+                  type: 'NOSQL_INJECTION',
+                  message: 'Unsanitized user input passed into MongoDB $where operator (NoSQL code injection).'
+                });
+              }
+            }
+          }
+        }
+
+        // 6. Prototype Pollution: Object.assign(target, req.body)
+        if (!isTestFile && objName === 'Object' && propName === 'assign' && p.node.arguments.length >= 2) {
+          const srcArg = p.node.arguments.slice(1).find(a => isDirectTaintSource(a) || (a && a.type === 'Identifier' && isExprTainted(a, p.scope).tainted));
+          if (srcArg) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'PROTOTYPE_POLLUTION',
+              type: 'PROTOTYPE_POLLUTION',
+              message: 'Unsanitized request object merged via Object.assign() (Prototype Pollution / Mass Assignment risk). Pick explicit fields or validate with a schema.'
+            });
+          }
+        }
+        // 7. Code Injection: eval(tainted) / vm.runIn*(tainted)
+        const isIndirectEval = callee?.type === 'SequenceExpression' && callee.expressions?.some(e => e.type === 'Identifier' && e.name === 'eval');
+        const isGlobalEval = propName === 'eval' && ['globalThis', 'global', 'window'].includes(objName);
+        if (!isTestFile && objName === 'document' && (propName === 'write' || propName === 'writeln')) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'XSS',
+              type: 'XSS',
+              message: 'Inter-procedural taint flow: unsanitized user input passed to document.write() (DOM XSS).'
+            });
+          }
+        }
+        if (!isTestFile && (fnName === 'eval' || isIndirectEval || isGlobalEval || (objName === 'vm' && /^runIn/.test(propName || '')))) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'CRITICAL',
+              category: 'CODE_INJECTION',
+              type: 'CODE_INJECTION',
+              message: 'Inter-procedural taint flow: unsanitized user input reaches eval()/vm execution (Arbitrary Code Execution).'
+            });
+          }
+        }
+
+        // 8. Tainted executable in spawn / execFile
+        if (!isTestFile && (fnName === 'spawn' || fnName === 'spawnSync' || fnName === 'execFile' || fnName === 'execFileSync' || ['spawn', 'spawnSync', 'execFile', 'execFileSync'].includes(propName))) {
+          const arg0 = p.node.arguments[0];
+          if (arg0 && arg0.type !== 'StringLiteral' && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'CRITICAL',
+              category: 'COMMAND_INJECTION',
+              type: 'COMMAND_INJECTION',
+              message: 'Inter-procedural taint flow: unsanitized user input controls executable binary passed to spawn/execFile.'
+            });
+          }
+        }
+
+        // 8b. Reflected HTML XSS: res.send("<div>" + tainted) / res.send(`<div>${tainted}</div>`)
+        if (!isTestFile && (propName === 'send' || propName === 'end') && ['res', 'reply'].includes(objName)) {
+          const arg0 = p.node.arguments[0];
+          const hasHtmlTag =
+            (arg0?.type === 'TemplateLiteral' && /<[a-z][^>]*>/i.test(arg0.quasis.map(q => q.value.raw).join(''))) ||
+            (arg0?.type === 'BinaryExpression' && arg0.operator === '+' &&
+              ((arg0.left?.type === 'StringLiteral' && /<[a-z][^>]*>/i.test(arg0.left.value)) ||
+               (arg0.right?.type === 'StringLiteral' && /<[a-z][^>]*>/i.test(arg0.right.value))));
+          if (hasHtmlTag && isExprTainted(arg0, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'XSS',
+              type: 'XSS',
+              message: 'Inter-procedural taint flow: unsanitized user input interpolated into HTML response in res.send() (Reflected XSS).'
+            });
+          }
+        }
+
+        // 9. Open Redirect: res.redirect(req.query.next)
+        if (!isTestFile && propName === 'redirect' && ['res', 'reply'].includes(objName)) {
+          const targetArg = p.node.arguments.length >= 2 ? p.node.arguments[1] : p.node.arguments[0];
+          if (targetArg && isExprTainted(targetArg, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'OPEN_REDIRECT',
+              type: 'OPEN_REDIRECT',
+              message: 'Inter-procedural taint flow: unsanitized user input controls redirect target (Open Redirect risk). Validate against allowlisted paths/hosts.'
+            });
+          }
+        }
+      },
+
+      NewExpression(p) {
+        if (!isTestFile && p.node.callee?.type === 'Identifier' && p.node.callee.name === 'Function') {
+          if ((p.node.arguments || []).some(a => isExprTainted(a, p.scope).tainted)) {
+            issues.push({
+              file: filePath,
+              line: p.node.loc?.start?.line || 1,
+              severity: 'CRITICAL',
+              category: 'CODE_INJECTION',
+              type: 'CODE_INJECTION',
+              message: 'Inter-procedural taint flow: unsanitized user input passed to new Function() (Arbitrary Code Execution).'
+            });
+          }
+        }
+      },
+
+      AssignmentExpression(p) {
+        if (
+          !isTestFile &&
+          p.node.left?.type === 'MemberExpression' &&
+          p.node.left.computed &&
+          p.node.left.object?.type === 'MemberExpression' &&
+          p.node.left.object.computed &&
+          isExprTainted(p.node.left.object.property, p.scope).tainted &&
+          isExprTainted(p.node.left.property, p.scope).tainted
+        ) {
+          issues.push({
+            file: filePath,
+            line: p.node.loc?.start?.line || 1,
+            severity: 'CRITICAL',
+            category: 'PROTOTYPE_POLLUTION',
+            type: 'PROTOTYPE_POLLUTION',
+            message: 'Nested dynamic bracket assignment using unsanitized user keys (Prototype Pollution risk). Reject __proto__, constructor, and prototype keys.'
+          });
+        }
+        if (p.node.left?.type === 'MemberExpression' && p.node.left.property?.name === 'innerHTML') {
+          if (isExprTainted(p.node.right, p.scope).tainted) {
+            issues.push({
+              file: filePath,
+              line: p.node.loc?.start?.line || 1,
+              severity: 'HIGH',
+              category: 'XSS',
+              type: 'XSS',
+              message: 'Inter-procedural taint flow: unsanitized user input assigned to innerHTML (XSS risk).'
+            });
+          }
+        }
+      }
+    });
+  } catch {
+    // safe fallback
+  }
+
+  return issues;
+}

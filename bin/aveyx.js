@@ -51,20 +51,20 @@ function printHelp() {
   console.log(`  ${c.green}budget${c.reset}          Analyze context window token bloat & generate .cursorignore`);
   console.log(`  ${c.green}memory [cmd]${c.reset}    Manage persistent cross-session memory [record|recall|sync|clear]`);
   console.log(`  ${c.green}graph${c.reset}           Analyze AST codebase dependencies & detect circular import cycles`);
-  console.log(`  ${c.green}impact <file>${c.reset}   Analyze blast-radius & transitive downstream impact of file changes`);
+  console.log(`  ${c.green}impact <file>${c.reset}   Analyze blast-radius & downstream impact [--symbol <name>]`);
   console.log(`  ${c.green}compact${c.reset}         Shrink codebase tokens with Babel AST PageRank & callers [--xml|--json|--top|--budget]`);
   console.log(`  ${c.green}test-loop${c.reset}       Run test suite & synthesize structured AVEYX_FIX_PROMPT.md on failure`);
   console.log(`  ${c.green}checkpoint${c.reset}      Save atomic git-native working tree snapshot [save <label>|list|rollback]`);
   console.log(`  ${c.green}rollback${c.reset}        Restore working tree, .env & hooks to previous checkpoint`);
   console.log(`  ${c.green}trace <symbol>${c.reset}  Trace declaration & cross-file call sites with AST call-graph`);
-  console.log(`  ${c.green}audit-bugs${c.reset}      Static AST scan for runtime bugs (SQL injection, hook leaks, floating promises)`);
+  console.log(`  ${c.green}audit-bugs${c.reset}      Static AST & inter-procedural taint scan (SQLi, CMDi, SSRF, Path Traversal, NoSQLi)\n  ${c.green}anti-slop${c.reset}       AST anti-slop ruleset (empty catches, silent error masking, stubs, redundant wrappers)`);
   console.log(`  ${c.green}cost${c.reset}            Measure repo token volume, AST compaction savings & optional --price-in=<$/1M>`);
   console.log(`  ${c.green}handoff${c.reset}         Generate clean session handoff block to reduce context drift`);
   console.log(`  ${c.green}export-all${c.reset}      Generate configs for Claude, Cursor, Windsurf, Copilot, & Aider`);
   console.log(`  ${c.green}cursor-rules${c.reset}    Export modern .cursor/rules/*.mdc files into current project`);
   console.log(`  ${c.green}inject${c.reset}          Inject rules into local CLAUDE.md and .cursorrules`);
-  console.log(`  ${c.green}install-hooks${c.reset}   Install pre-commit (and optional --pre-push) git safety hooks`);
-  console.log(`  ${c.green}scan-secrets${c.reset}    Scan workspace files for leaked credentials`);
+  console.log(`  ${c.green}install-hooks${c.reset}   Install git safety hooks (and optional --claude / --all runtime hooks)\n  ${c.green}hook-guard${c.reset}      Run Claude Code PreToolUse safety guard (reads stdin JSON)`);
+  console.log(`  ${c.green}scan-secrets${c.reset}    Scan workspace files & AST entropy for leaked credentials [--unpushed]\n  ${c.green}check-deps${c.reset}      Offline slopsquatting, hallucinated import & lockfile drift guard\n  ${c.green}mcp-audit${c.reset}       Audit MCP configs for tool-poisoning, unpinned npx & rug-pull drift`);
   console.log(`  ${c.green}sandbox${c.reset}         Manage isolated Git Worktree sandboxes [start|clean|status]`);
   console.log(`  ${c.green}mcp${c.reset}             Start the native Model Context Protocol (MCP) server`);
   console.log(`  ${c.green}test${c.reset}            Run the automated schema validation suite`);
@@ -299,6 +299,12 @@ function handleTrace(args) {
   child.on('exit', (code) => process.exit(code || 0));
 }
 
+function handleAntiSlop(args) {
+  const s = path.join(ROOT_DIR, 'scripts', 'anti-slop-ast.js');
+  const child = spawn(process.execPath, [s, ...args], { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code || 0));
+}
+
 function handleAuditBugs(args) {
   const auditBugsScript = path.join(ROOT_DIR, 'scripts', 'audit-bugs.js');
   const child = spawn(process.execPath, [auditBugsScript, ...args], { stdio: 'inherit' });
@@ -347,6 +353,12 @@ function handleInit(args) {
   console.log(`  • Cross-session persistent memory ('npx aveyx memory')\n`);
 }
 
+function handleHookGuard(args = []) {
+  const guardScript = path.join(ROOT_DIR, 'scripts', 'agent-hook-guard.js');
+  const child = spawn(process.execPath, [guardScript, ...args], { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code || 0));
+}
+
 function handleInstallHooks(args = []) {
   const hooksScript = path.join(ROOT_DIR, 'scripts', 'install-hooks.js');
   const child = spawn(process.execPath, [hooksScript, ...args], { stdio: 'inherit' });
@@ -364,6 +376,18 @@ function handleSandbox(subAction = 'status', name = null) {
   const sandboxArgs = [sandboxScript, subAction || 'status'];
   if (name) sandboxArgs.push(name);
   const child = spawn(process.execPath, sandboxArgs, { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code || 0));
+}
+
+function handleCheckDeps(args) {
+  const s = path.join(ROOT_DIR, 'scripts', 'check-deps.js');
+  const child = spawn(process.execPath, [s, ...args], { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code || 0));
+}
+
+function handleMcpAudit(args) {
+  const s = path.join(ROOT_DIR, 'scripts', 'mcp-audit.js');
+  const child = spawn(process.execPath, [s, ...args], { stdio: 'inherit' });
   child.on('exit', (code) => process.exit(code || 0));
 }
 
@@ -443,6 +467,10 @@ function handleDoctor() {
     { name: 'Anti-Cheat Test Guard', status: antiCheatStatus },
     { name: 'Git Worktree Sandbox', status: hasGit ? 'Available (npx aveyx sandbox)' : 'Requires git repo' },
     { name: 'Pre-Commit Safety Hooks', status: hookStatus },
+    { name: 'Claude Runtime Hooks', status: fs.existsSync(path.join(cwd, '.claude', 'settings.json')) ? 'Configured (.claude/settings.json)' : 'Available (npx aveyx install-hooks --claude)' },
+    { name: 'Anti-Slop AST Engine', status: 'Ready (npx aveyx anti-slop)' },
+    { name: 'Offline Slopsquat Guard', status: 'Ready (npx aveyx check-deps)' },
+    { name: 'MCP Security Auditor', status: 'Ready (npx aveyx mcp-audit)' },
     { name: 'Native MCP Server', status: 'Built-in (npx aveyx mcp)' }
   ];
 
@@ -563,6 +591,9 @@ switch (command) {
   case 'lint-ast':
     handleAuditBugs(args.slice(1));
     break;
+  case 'anti-slop':
+    handleAntiSlop(args.slice(1));
+    break;
   case 'cost':
     handleCost(args.slice(1));
     break;
@@ -581,8 +612,17 @@ switch (command) {
   case 'install-hooks':
     handleInstallHooks(args.slice(1));
     break;
+  case 'hook-guard':
+    handleHookGuard(args.slice(1));
+    break;
   case 'scan-secrets':
     handleScanSecrets(args.slice(1));
+    break;
+  case 'check-deps':
+    handleCheckDeps(args.slice(1));
+    break;
+  case 'mcp-audit':
+    handleMcpAudit(args.slice(1));
     break;
   case 'sandbox':
     handleSandbox(args[1], args[2]);

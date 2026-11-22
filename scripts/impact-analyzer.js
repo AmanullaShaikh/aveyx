@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildDependencyGraph } from './dependency-graph.js';
+import { buildDependencyGraph, extractSymbolCallers } from './dependency-graph.js';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -50,9 +50,10 @@ function getGitChangedFiles(projectDir) {
 
 /**
  * Computes transitive reverse-dependency blast radius for modified or target files.
+ * Supports optional symbol-level filtering via options.symbols (e.g. { symbols: ['verifyToken'] }).
  * Identifies direct dependents, transitive dependents, affected test suites, and risk level.
  */
-export function analyzeImpact(targets = [], projectDir = process.cwd()) {
+export function analyzeImpact(targets = [], projectDir = process.cwd(), options = {}) {
   const absRoot = path.resolve(projectDir);
   let normalizedTargets = (Array.isArray(targets) ? targets : [targets])
     .filter(t => typeof t === 'string' && t.trim().length > 0)
@@ -65,6 +66,10 @@ export function analyzeImpact(targets = [], projectDir = process.cwd()) {
   if (normalizedTargets.length === 0) {
     normalizedTargets = getGitChangedFiles(absRoot);
   }
+
+  const symbols = Array.isArray(options?.symbols)
+    ? Array.from(new Set(options.symbols.filter(s => typeof s === 'string' && s.trim().length > 0).map(s => s.trim())))
+    : [];
 
   const { graph, pageRank, modulesCount } = buildDependencyGraph(absRoot);
 
@@ -81,9 +86,33 @@ export function analyzeImpact(targets = [], projectDir = process.cwd()) {
   }
 
   const visited = new Set(normalizedTargets);
-  const queue = normalizedTargets.map(t => ({ file: t, depth: 0 }));
   const directDependents = new Set();
   const transitiveDependents = new Set();
+  const queue = [];
+  const symbolCallSites = [];
+
+  if (symbols.length > 0) {
+    const callersBySource = extractSymbolCallers(absRoot);
+    for (const target of normalizedTargets) {
+      const fileCallers = callersBySource[target] || {};
+      for (const sym of symbols) {
+        const sites = fileCallers[sym];
+        if (!Array.isArray(sites)) continue;
+        for (const site of sites) {
+          symbolCallSites.push({ target, symbol: sym, file: site.file, line: site.line });
+          if (!visited.has(site.file)) {
+            visited.add(site.file);
+            directDependents.add(site.file);
+            queue.push({ file: site.file, depth: 1 });
+          }
+        }
+      }
+    }
+  } else {
+    for (const t of normalizedTargets) {
+      queue.push({ file: t, depth: 0 });
+    }
+  }
 
   while (queue.length > 0) {
     const { file, depth } = queue.shift();
@@ -104,7 +133,7 @@ export function analyzeImpact(targets = [], projectDir = process.cwd()) {
 
   const allImpacted = Array.from(new Set([...directDependents, ...transitiveDependents])).sort();
   const affectedTests = Array.from(new Set(
-    [...normalizedTargets, ...allImpacted].filter(f => /\.(test|spec)\.[a-z0-9]+$/i.test(f) || /^tests\//i.test(f))
+    [...normalizedTargets, ...allImpacted].filter(f => /\.(test|spec)\.[a-z0-9]+$/i.test(f) || /(?:^|\/)test_[^/]+\.py$/i.test(f) || /_test\.(py|go)$/i.test(f) || /^tests\//i.test(f))
   )).sort();
 
   const maxPageRank = normalizedTargets.reduce((max, t) => Math.max(max, pageRank.get(t) || 0), 0);
@@ -119,7 +148,8 @@ export function analyzeImpact(targets = [], projectDir = process.cwd()) {
     transitiveDependents: Array.from(transitiveDependents).sort(),
     allImpacted,
     affectedTests,
-    riskLevel
+    riskLevel,
+    ...(symbols.length > 0 ? { symbols, symbolCallSites } : {})
   };
 }
 
@@ -127,15 +157,34 @@ export function analyzeImpact(targets = [], projectDir = process.cwd()) {
 if (process.argv[1] && safeRealpath(process.argv[1]) === safeRealpath(__filename)) {
   const args = process.argv.slice(2);
   const knownFlags = new Set(['--json', '--diff']);
-  const unknownFlag = args.find(a => a.startsWith('-') && !knownFlags.has(a));
-  if (unknownFlag) {
-    console.error(`${c.red}Unknown flag: ${unknownFlag}${c.reset}`);
-    console.error('Usage: npx aveyx impact [file1 file2 ...] [--diff] [--json]');
-    process.exit(1);
+  const symbols = [];
+  const positional = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--symbol' || a === '--symbols') {
+      const next = args[i + 1];
+      if (!next || next.startsWith('-')) {
+        console.error(`${c.red}Error: ${a} requires a symbol name.${c.reset}`);
+        process.exit(1);
+      }
+      symbols.push(...next.split(',').map(s => s.trim()).filter(Boolean));
+      i++;
+    } else if (a.startsWith('--symbol=') || a.startsWith('--symbols=')) {
+      const val = a.slice(a.indexOf('=') + 1);
+      symbols.push(...val.split(',').map(s => s.trim()).filter(Boolean));
+    } else if (a.startsWith('-')) {
+      if (!knownFlags.has(a)) {
+        console.error(`${c.red}Unknown flag: ${a}${c.reset}`);
+        console.error('Usage: npx aveyx impact [file1 file2 ...] [--symbol <name>] [--diff] [--json]');
+        process.exit(1);
+      }
+    } else {
+      positional.push(a);
+    }
   }
 
   const jsonMode = args.includes('--json');
-  const positional = args.filter(a => !a.startsWith('-'));
 
   for (const target of positional) {
     const resolved = path.resolve(process.cwd(), target);
@@ -154,7 +203,7 @@ if (process.argv[1] && safeRealpath(process.argv[1]) === safeRealpath(__filename
     }
   }
 
-  const report = analyzeImpact(positional, process.cwd());
+  const report = analyzeImpact(positional, process.cwd(), { symbols });
 
   if (jsonMode) {
     console.log(JSON.stringify(report, null, 2));
@@ -169,6 +218,9 @@ if (process.argv[1] && safeRealpath(process.argv[1]) === safeRealpath(__filename
 
   const riskColor = report.riskLevel === 'HIGH' ? c.red : (report.riskLevel === 'MEDIUM' ? c.yellow : c.green);
   console.log(`  Targets (${report.targets.length})       : ${c.cyan}${report.targets.join(', ')}${c.reset}`);
+  if (report.symbols && report.symbols.length > 0) {
+    console.log(`  Filtered Symbols  : ${c.cyan}${report.symbols.join(', ')}${c.reset}`);
+  }
   console.log(`  Blast Radius Risk : ${riskColor}${c.bold}${report.riskLevel}${c.reset} (${report.allImpacted.length} downstream modules across ${report.modulesScanned} scanned)`);
   console.log(`  Direct Dependents : ${c.bold}${report.directDependents.length}${c.reset}`);
   for (const f of report.directDependents) console.log(`    • ${f}`);

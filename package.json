@@ -36,7 +36,10 @@
     "install-hooks": "node ./bin/aveyx.js install-hooks",
     "cursor-rules": "node ./bin/aveyx.js cursor-rules",
     "inject": "node ./bin/aveyx.js inject",
-    "mcp": "node ./bin/mcp-server.js"
+    "mcp": "node ./bin/mcp-server.js",
+    "check-deps": "node ./bin/aveyx.js check-deps",
+    "mcp-audit": "node ./bin/aveyx.js mcp-audit",
+    "anti-slop": "node ./bin/aveyx.js anti-slop"
   },
   "keywords": [
     "aveyx",
@@ -75,5 +78,13 @@
     "@babel/generator": "^8.1.2",
     "@babel/parser": "^8.1.2",
     "@babel/traverse": "^8.1.2"
+  },
+  "peerDependencies": {
+    "oxc-parser": ">=0.50.0"
+  },
+  "peerDependenciesMeta": {
+    "oxc-parser": {
+      "optional": true
+    }
   }
 }

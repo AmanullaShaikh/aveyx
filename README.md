@@ -46,19 +46,23 @@ Run directly with `npx` — zero global install or API keys required:
 npx aveyx init
 ```
 
-### Command Reference (`v3.0.4`)
+### Command Reference (`v4.0.0-dev` — 10 Core Engines)
 
 | Command | Category | What It Does |
 | :--- | :--- | :--- |
 | `npx aveyx init` | Setup | Injects directives into `CLAUDE.md`/`.cursorrules`, exports `.cursor/rules/*.mdc`, installs pre-commit hook |
 | `npx aveyx compact` | Context | AST compactor for JS/TS/Py/Go/Rust with PageRank & reverse callers (`--xml`, `--json`, `--top`, `--budget`) |
-| `npx aveyx impact [files]` | Architecture | Computes transitive AST blast radius, affected test suites, and risk level (`--diff`, `--json`) |
+| `npx aveyx impact [files]` | Architecture | Polyglot (JS/TS/Py/Go/Rust) blast radius with `tsconfig` paths, barrel re-exports & `--symbol <name>` |
 | `npx aveyx graph` | Architecture | Builds AST import/export dependency graph, PageRank centrality, and detects import cycles |
 | `npx aveyx trace <symbol>` | Code Intel | Traces symbol declarations and cross-file call sites into a compact dossier |
-| `npx aveyx audit-bugs` | Static Scan | Babel AST scanner for SQL injection, React `useEffect` leaks, and floating promises (`--format=sarif`) |
+| `npx aveyx audit-bugs` | Static Scan | Inter-procedural taint & AST bug scanner (SQLi, CMDi, SSRF, Path Traversal, NoSQLi, XSS, Prototype Pollution, `useEffect` leaks) |
+| `npx aveyx anti-slop` | Code Quality | AST anti-slop ruleset catching empty `catch {}`, silent error masking, stubs, dead branches & redundant wrappers |
 | `npx aveyx review` | Security | Babel AST + regex git diff auditor for secrets, protected configs, and test tampering (`--staged`, `--strict`, `--format=sarif`) |
-| `npx aveyx scan-secrets` | Security | Full-workspace credential scanner supporting cross-line splits and obfuscation |
-| `npx aveyx install-hooks` | Security | Installs worktree-aware `pre-commit` (and optional `--pre-push`) git safety hooks |
+| `npx aveyx scan-secrets` | Security | Workspace + AST Shannon entropy secret scanner with `--unpushed` git commit history sweep |
+| `npx aveyx check-deps` | Supply Chain | Offline slopsquatting, typosquatting (npm/PyPI/Cargo/Go), lockfile drift & lifecycle RCE guard |
+| `npx aveyx mcp-audit` | MCP Security | Audits MCP configs & tool schemas for prompt poisoning, stego, shadowing, unpinned `npx` & `--pin` rug-pull drift |
+| `npx aveyx install-hooks` | Security | Installs worktree-aware `pre-commit`, `--pre-push`, and Claude Code `--claude` / `--all` runtime hooks |
+| `npx aveyx hook-guard` | Runtime | Claude Code / Cursor `PreToolUse` guard blocking hook bypasses, force pushes, wipes & credential exfil |
 | `npx aveyx test-loop` | Testing | Runs project test suite and generates structured `AVEYX_FIX_PROMPT.md` on failure |
 | `npx aveyx checkpoint` | Safe State | Saves atomic git snapshot including untracked files, `.env`, and `.git/hooks` |
 | `npx aveyx rollback` | Safe State | Restores working tree, wipes rogue untracked files, and restores `.env` & hooks (preserves branch) |
@@ -93,7 +97,7 @@ Before or after editing a shared module, compute every direct and transitive dep
 
 ```bash
 # Analyze specific modified files
-npx aveyx impact src/auth/service.ts
+npx aveyx impact src/auth/service.ts --symbol verifyToken
 
 # Analyze uncommitted git changes as JSON
 npx aveyx impact --diff --json

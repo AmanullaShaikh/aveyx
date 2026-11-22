@@ -527,6 +527,156 @@ function astAuditTestSnippet(file, code) {
             });
           }
         }
+        // 1b. Self-Mocking Unit Under Test (vi.mock / jest.mock / mock.module)
+        if (
+          callee?.type === 'MemberExpression' &&
+          callee.object?.type === 'Identifier' &&
+          ['vi', 'jest', 'mock'].includes(callee.object.name) &&
+          callee.property?.type === 'Identifier' &&
+          ['mock', 'doMock', 'module'].includes(callee.property.name)
+        ) {
+          const firstArg = p.node.arguments?.[0];
+          let mockTargetStr = null;
+          if (firstArg?.type === 'StringLiteral' && firstArg.value) {
+            mockTargetStr = firstArg.value;
+          } else if (firstArg?.type === 'ImportExpression' && firstArg.source?.type === 'StringLiteral') {
+            mockTargetStr = firstArg.source.value;
+          } else if (firstArg?.type === 'CallExpression' && firstArg.callee?.type === 'Import' && firstArg.arguments?.[0]?.type === 'StringLiteral') {
+            mockTargetStr = firstArg.arguments[0].value;
+          }
+          if (mockTargetStr) {
+            const testBase = file.split('/').pop().replace(/\.(test|spec)\.[a-z0-9]+$/i, '').toLowerCase();
+            const mockClean = mockTargetStr.replace(/\/index(?:\.[a-z0-9]+)?$/i, '');
+            const mockBase = mockClean.split('/').pop().replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+            if (testBase && mockBase && (testBase === mockBase || mockBase === testBase.replace(/[-_.]?(unit|integration)$/i, ''))) {
+              astIssues.push({
+                severity: 'CRITICAL',
+                category: 'TEST_TAMPERING',
+                file,
+                line: p.node.loc?.start?.line || 1,
+                description: `AI Agent Attempted Test Weakening: Self-mocking unit under test (${mockTargetStr}) (AST)`,
+                snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || mockTargetStr
+              });
+            }
+          }
+        }
+
+        // 1c. AST Tautological Assertions (multiline & expression-safe)
+        const getSimpleNodeKey = (n) => {
+          if (!n) return null;
+          if (n.type === 'Identifier') return `id:${n.name}`;
+          if (n.type === 'StringLiteral') return `str:${n.value}`;
+          if (n.type === 'NumericLiteral') return `num:${n.value}`;
+          if (n.type === 'BooleanLiteral') return `bool:${n.value}`;
+          if (n.type === 'NullLiteral') return 'null';
+          if (n.type === 'MemberExpression' && !n.computed && n.property?.type === 'Identifier') {
+            const objKey = getSimpleNodeKey(n.object);
+            if (objKey) return `${objKey}.${n.property.name}`;
+          }
+          return null;
+        };
+        const isLiteralNode = (n) => n && ['StringLiteral', 'NumericLiteral', 'BooleanLiteral', 'NullLiteral'].includes(n.type);
+
+        if (
+          callee?.type === 'MemberExpression' &&
+          callee.object?.type === 'CallExpression' &&
+          callee.object.callee?.type === 'Identifier' &&
+          callee.object.callee.name === 'expect' &&
+          (callee.property?.type === 'Identifier' || callee.property?.type === 'StringLiteral')
+        ) {
+          const matcher = callee.property.type === 'Identifier' ? callee.property.name : callee.property.value;
+          const lhs = callee.object.arguments?.[0];
+          const rhs = p.node.arguments?.[0];
+          if (['toBe', 'toEqual', 'toStrictEqual'].includes(matcher)) {
+            const k1 = getSimpleNodeKey(lhs);
+            const k2 = getSimpleNodeKey(rhs);
+            if (k1 && k2 && k1 === k2) {
+              astIssues.push({
+                severity: 'CRITICAL',
+                category: 'TEST_TAMPERING',
+                file,
+                line: p.node.loc?.start?.line || 1,
+                description: 'AI Agent Attempted Test Weakening: Tautological Assertion (identical operands) (AST)',
+                snippet: code.split('\n').slice((p.node.loc?.start?.line || 1) - 1, p.node.loc?.end?.line || (p.node.loc?.start?.line || 1)).map(l => l.trim()).join(' ').slice(0, 80) || `expect(...).${matcher}(...)`
+              });
+            }
+          } else if (['toBeTruthy', 'toBeFalsy', 'toBeDefined'].includes(matcher) && isLiteralNode(lhs)) {
+            astIssues.push({
+              severity: 'CRITICAL',
+              category: 'TEST_TAMPERING',
+              file,
+              line: p.node.loc?.start?.line || 1,
+              description: `AI Agent Attempted Test Weakening: Tautological literal assertion (expect(literal).${matcher}()) (AST)`,
+              snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || `expect(literal).${matcher}()`
+            });
+          }
+        }
+
+        if (
+          callee?.type === 'MemberExpression' &&
+          callee.object?.type === 'MemberExpression' &&
+          callee.object.property?.name === 'not' &&
+          callee.object.object?.type === 'CallExpression' &&
+          callee.object.object.callee?.name === 'expect' &&
+          ['toBe', 'toEqual', 'toStrictEqual'].includes(callee.property?.name)
+        ) {
+          const lhs = callee.object.object.arguments?.[0];
+          const rhs = p.node.arguments?.[0];
+          if (isLiteralNode(lhs) && isLiteralNode(rhs)) {
+            astIssues.push({
+              severity: 'CRITICAL',
+              category: 'TEST_TAMPERING',
+              file,
+              line: p.node.loc?.start?.line || 1,
+              description: `AI Agent Attempted Test Weakening: Tautological literal-vs-literal .not.${callee.property.name}() assertion (AST)`,
+              snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || 'expect(lit).not.toBe(lit)'
+            });
+          }
+        }
+
+        if (
+          callee?.type === 'MemberExpression' &&
+          callee.object?.type === 'Identifier' &&
+          callee.object.name === 'assert' &&
+          callee.property?.type === 'Identifier'
+        ) {
+          const mName = callee.property.name;
+          const a0 = p.node.arguments?.[0];
+          const a1 = p.node.arguments?.[1];
+          if (['strictEqual', 'equal', 'deepStrictEqual', 'deepEqual'].includes(mName)) {
+            const k1 = getSimpleNodeKey(a0);
+            const k2 = getSimpleNodeKey(a1);
+            if (k1 && k2 && k1 === k2) {
+              astIssues.push({
+                severity: 'CRITICAL',
+                category: 'TEST_TAMPERING',
+                file,
+                line: p.node.loc?.start?.line || 1,
+                description: `AI Agent Attempted Test Weakening: Tautological assert.${mName}(x, x) (AST)`,
+                snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || `assert.${mName}(...)`
+              });
+            }
+          } else if (['notStrictEqual', 'notEqual'].includes(mName) && isLiteralNode(a0) && isLiteralNode(a1)) {
+            astIssues.push({
+              severity: 'CRITICAL',
+              category: 'TEST_TAMPERING',
+              file,
+              line: p.node.loc?.start?.line || 1,
+              description: `AI Agent Attempted Test Weakening: Tautological literal-vs-literal assert.${mName}(lit, lit) (AST)`,
+              snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || `assert.${mName}(...)`
+            });
+          } else if (mName === 'ok' && isLiteralNode(a0)) {
+            astIssues.push({
+              severity: 'CRITICAL',
+              category: 'TEST_TAMPERING',
+              file,
+              line: p.node.loc?.start?.line || 1,
+              description: 'AI Agent Attempted Test Weakening: Tautological assert.ok(literal) (AST)',
+              snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || 'assert.ok(literal)'
+            });
+          }
+        }
+
         // 2. Empty test body: test('x', () => {}) or it('x', function() {})
         let testFnName = null;
         if (callee?.type === 'Identifier' && ['test', 'it'].includes(callee.name)) {
@@ -820,7 +970,7 @@ export function auditDiff(rawDiff) {
       if (currentFile === 'package.json' && /"test"\s*:/.test(line)) {
         deletedPkgTestLine.add(currentFile);
       }
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
       const isTestFile = (currentFile.includes('.test.') || currentFile.includes('.spec.') || currentFile.includes('tests/')) && !isSelfAuditTest;
       const deletedText = line.substring(1).trim();
       if (isTestFile && /\b(expect|assert(?:\.[a-zA-Z0-9_$]+)?|should(?:\.[a-zA-Z0-9_$]+)?)\s*\(/.test(deletedText) && !deletedText.startsWith('//')) {
@@ -832,7 +982,7 @@ export function auditDiff(rawDiff) {
     if (line.startsWith('+') && !line.startsWith('+++')) {
       const addedText = line.substring(1);
 
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
       if (currentFile === 'package.json' && deletedPkgTestLine.has('package.json') && /"test"\s*:\s*"(?:echo\b|true\b|exit\s+0|:|\s*node\s+-e\s+['"]?(?:0|process\.exit\(0\)|;?)['"]?|.*(?:\|\||\||;|&&|&)\s*(?:exit\s+[0-9]+|true\b|:))/i.test(addedText)) {
         issues.push({
           severity: 'CRITICAL',

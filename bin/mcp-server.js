@@ -184,6 +184,11 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Optional list of relative file paths to analyze. If omitted, uses uncommitted git changes.'
         },
+        symbols: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional exported symbol names to filter blast radius to actual call sites.'
+        },
         project_dir: {
           type: 'string',
           description: 'Optional workspace root directory (must stay inside server cwd).'
@@ -203,6 +208,26 @@ const TOOLS = [
         }
       },
       required: ['diff']
+    }
+  },
+  {
+    name: 'aveyx_check_deps',
+    description: 'Offline slopsquatting, typosquatting, undeclared import, and lockfile drift guard for JS/TS, Python, and Rust.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_dir: { type: 'string', description: 'Optional workspace directory (must stay inside server cwd).' }
+      }
+    }
+  },
+  {
+    name: 'aveyx_mcp_audit',
+    description: 'Audits MCP configuration files for tool-poisoning, Base64/Unicode steganography, unpinned npx packages, hardcoded secrets, and rug-pull drift.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_dir: { type: 'string', description: 'Optional workspace directory (must stay inside server cwd).' }
+      }
     }
   }
 ];
@@ -507,7 +532,8 @@ async function handleMessage(msg) {
         }
         const { analyzeImpact } = await import('../scripts/impact-analyzer.js');
         const filesArg = Array.isArray(args?.files) ? args.files : [];
-        const res = analyzeImpact(filesArg, requestedDir);
+        const symbolsArg = Array.isArray(args?.symbols) ? args.symbols : [];
+        const res = analyzeImpact(filesArg, requestedDir, { symbols: symbolsArg });
         sendResponse(id, {
           content: [{ type: 'text', text: JSON.stringify(res, null, 2) }]
         });
@@ -532,6 +558,44 @@ async function handleMessage(msg) {
           isError: true,
           content: [{ type: 'text', text: `Error auditing diff: ${err.message}` }]
         });
+      }
+      return;
+    }
+
+    if (name === 'aveyx_check_deps') {
+      try {
+        const workspaceRoot = path.resolve(process.cwd());
+        const requestedDir = args?.project_dir ? path.resolve(workspaceRoot, String(args.project_dir)) : workspaceRoot;
+        const rel = path.relative(workspaceRoot, requestedDir);
+        const allowExternal = process.env.AVEYX_ALLOW_EXTERNAL_DIR === '1';
+        if (!allowExternal && (rel.startsWith('..') || path.isAbsolute(rel))) {
+          sendResponse(id, { isError: true, content: [{ type: 'text', text: 'Error: project_dir must stay within the active workspace directory.' }] });
+          return;
+        }
+        const { checkDependencies } = await import('../scripts/check-deps.js');
+        const res = checkDependencies(requestedDir);
+        sendResponse(id, { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] });
+      } catch (err) {
+        sendResponse(id, { isError: true, content: [{ type: 'text', text: `Error checking deps: ${err.message}` }] });
+      }
+      return;
+    }
+
+    if (name === 'aveyx_mcp_audit') {
+      try {
+        const workspaceRoot = path.resolve(process.cwd());
+        const requestedDir = args?.project_dir ? path.resolve(workspaceRoot, String(args.project_dir)) : workspaceRoot;
+        const rel = path.relative(workspaceRoot, requestedDir);
+        const allowExternal = process.env.AVEYX_ALLOW_EXTERNAL_DIR === '1';
+        if (!allowExternal && (rel.startsWith('..') || path.isAbsolute(rel))) {
+          sendResponse(id, { isError: true, content: [{ type: 'text', text: 'Error: project_dir must stay within the active workspace directory.' }] });
+          return;
+        }
+        const { auditMcpConfigs } = await import('../scripts/mcp-audit.js');
+        const res = auditMcpConfigs(requestedDir);
+        sendResponse(id, { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] });
+      } catch (err) {
+        sendResponse(id, { isError: true, content: [{ type: 'text', text: `Error auditing MCP configs: ${err.message}` }] });
       }
       return;
     }

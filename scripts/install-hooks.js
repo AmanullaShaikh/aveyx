@@ -154,9 +154,60 @@ fi
   return true;
 }
 
+
+export function installClaudeHooks(projectDir = process.cwd()) {
+  const claudeDir = path.join(projectDir, '.claude');
+  const settingsPath = path.join(claudeDir, 'settings.json');
+  fs.mkdirSync(claudeDir, { recursive: true });
+
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      const backupPath = `${settingsPath}.aveyx-backup.${Date.now()}`;
+      fs.copyFileSync(settingsPath, backupPath);
+    } catch {
+      settings = {};
+    }
+  }
+
+  if (!settings || typeof settings !== 'object') settings = {};
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+
+  const preToolCmd = fs.existsSync(path.join(projectDir, 'scripts', 'agent-hook-guard.js'))
+    ? 'node ./scripts/agent-hook-guard.js'
+    : 'npx aveyx hook-guard';
+  const stopCmd = fs.existsSync(path.join(projectDir, 'scripts', 'audit-diff.js'))
+    ? 'node ./scripts/audit-diff.js --strict'
+    : 'npx aveyx review --strict';
+
+  const preToolList = Array.isArray(settings.hooks.PreToolUse) ? settings.hooks.PreToolUse : [];
+  if (!JSON.stringify(preToolList).includes('agent-hook-guard') && !JSON.stringify(preToolList).includes('aveyx hook-guard')) {
+    preToolList.push({
+      matcher: 'Bash|Read|Edit|Write',
+      hooks: [{ type: 'command', command: preToolCmd }]
+    });
+  }
+  settings.hooks.PreToolUse = preToolList;
+
+  const stopList = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
+  if (!JSON.stringify(stopList).includes('audit-diff') && !JSON.stringify(stopList).includes('aveyx review')) {
+    stopList.push({
+      hooks: [{ type: 'command', command: stopCmd }]
+    });
+  }
+  settings.hooks.Stop = stopList;
+
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  console.log(`\x1b[32m\x1b[1m✓ Configured Aveyx Claude Code runtime hooks in .claude/settings.json\x1b[0m`);
+  return true;
+}
+
 if (process.argv[1] && process.argv[1].endsWith('install-hooks.js')) {
-  const prePush = process.argv.includes('--pre-push');
+  const prePush = process.argv.includes('--pre-push') || process.argv.includes('--all');
+  const claude = process.argv.includes('--claude') || process.argv.includes('--all');
   const installed = installGitHooks(process.cwd(), { prePush });
+  if (installed && claude) installClaudeHooks(process.cwd());
   if (!installed) {
     process.exit(1);
   }

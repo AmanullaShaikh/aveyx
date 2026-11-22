@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from '@babel/parser';
 import { buildSarifReport } from './audit-diff.js';
+import { resolveImportPath } from './dependency-graph.js';
+import { analyzeInterProceduralTaint, extractFileExportSummaries } from './taint-engine.js';
 import _traverse from '@babel/traverse';
 
 const traverse = _traverse.default || _traverse;
@@ -71,7 +73,7 @@ function getSourceFiles(dir, visited = new Set()) {
 /**
  * Audits a single source code file for production runtime AST bugs.
  */
-export function auditCodeBugs(code, filePath = 'unknown.ts') {
+export function auditCodeBugs(code, filePath = 'unknown.ts', options = {}) {
   const issues = [];
   let ast;
 
@@ -779,6 +781,12 @@ export function auditCodeBugs(code, filePath = 'unknown.ts') {
     // traversal fallback
   }
 
+  const importedSummaries = options?.importedSummaries instanceof Map ? options.importedSummaries : new Map();
+  const taintIssues = analyzeInterProceduralTaint(ast, filePath, importedSummaries);
+  for (const ti of taintIssues) {
+    const dup = issues.some(i => i.file === ti.file && i.line === ti.line && i.category === ti.category);
+    if (!dup) issues.push(ti);
+  }
   return issues;
 }
 
@@ -787,13 +795,38 @@ export function auditCodeBugs(code, filePath = 'unknown.ts') {
  */
 export function auditWorkspaceBugs(projectDir = process.cwd()) {
   const files = getSourceFiles(projectDir);
-  let allIssues = [];
+  const absRoot = path.resolve(projectDir);
+  const fileExportSummaries = new Map();
+  const fileContents = new Map();
 
   for (const file of files) {
-    const relPath = path.relative(projectDir, file).replace(/\\/g, '/');
+    const relPath = path.relative(absRoot, file).replace(/\\/g, '/');
     try {
       const code = fs.readFileSync(file, 'utf-8');
-      const fileIssues = auditCodeBugs(code, relPath);
+      fileContents.set(file, { relPath, code });
+      fileExportSummaries.set(relPath, extractFileExportSummaries(code));
+    } catch {}
+  }
+
+  let allIssues = [];
+  for (const [file, { relPath, code }] of fileContents.entries()) {
+    try {
+      const importedSummaries = new Map();
+      for (const m of code.matchAll(/import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g)) {
+        const resolved = resolveImportPath(file, m[2], absRoot);
+        if (resolved.type === 'internal' && fileExportSummaries.has(resolved.path)) {
+          const srcMap = fileExportSummaries.get(resolved.path);
+          for (const spec of m[1].split(',')) {
+            const parts = spec.trim().split(/\s+as\s+/);
+            const orig = parts[0]?.trim();
+            const local = (parts[1] || parts[0])?.trim();
+            if (orig && local && srcMap.has(orig)) {
+              importedSummaries.set(local, srcMap.get(orig));
+            }
+          }
+        }
+      }
+      const fileIssues = auditCodeBugs(code, relPath, { importedSummaries });
       allIssues = allIssues.concat(fileIssues);
     } catch {
       // skip unreadable file
