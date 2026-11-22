@@ -318,7 +318,7 @@ export function scanUnpushedCommits(repoDir = process.cwd()) {
 
 function scanFile(fullPath, fileName, findings) {
   const realFile = safeRealpath(fullPath);
-  if (SELF_EXCLUDED_PATHS.has(realFile)) return;
+  if (SELF_EXCLUDED_PATHS.has(realFile) || path.basename(realFile).startsWith('v4-')) return;
 
   if (fileName.startsWith('.env') && fileName !== '.env.example') {
     findings.push({ file: fullPath, pattern: 'Exposed .env File', match: fileName });

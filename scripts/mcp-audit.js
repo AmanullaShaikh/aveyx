@@ -127,12 +127,26 @@ function hashServerConfig(serverDef) {
 
 function isOverprivilegedMountArg(arg) {
   const s = String(arg || '').trim();
-  if (/^(?:\/|~|\$HOME|\$\{HOME\}|c:\\?)$/i.test(s)) return true;
-  if (/^\/(?:home|Users|etc)(?:\/[^/\s]+)?\/?$/i.test(s)) return true;
-  // Docker bind mount: -v /:/host or /home/u:/data
-  if (s.includes(':')) {
-    const src = s.split(':')[0];
-    if (/^(?:\/|~|\$HOME|\/home(?:\/[^/]+)?|\/Users(?:\/[^/]+)?|\/etc)$/i.test(src)) return true;
+  if (!s) return false;
+  if (/^(?:\/|~|\$HOME|\$\{HOME\}|[a-zA-Z]:[\\/]?)$/i.test(s)) return true;
+  if (/^(?:\/(?:home|Users|etc)|[a-zA-Z]:[\\/]Users)(?:\/[^/\s]+)?\/?$/i.test(s)) return true;
+
+  // Docker bind mount: host:container[:ro]
+  // Extract host source path, correctly preserving Windows drive letter (e.g. C:\... or C:/...)
+  let src = s;
+  const winMatch = s.match(/^([a-zA-Z]:(?:\\|\/)?(?:[^:]*))\s*:(.*)$/);
+  if (winMatch) {
+    src = winMatch[1];
+  } else if (s.includes(':')) {
+    src = s.split(':')[0];
+  }
+
+  const normSrc = src.replace(/\\/g, '/').toLowerCase();
+  if (/^(?:\/|~|\$HOME|\$\{HOME\}|[a-zA-Z]:\/?)$/i.test(src) || /^(?:\/|~|\$HOME|\$\{HOME\}|[a-zA-Z]:\/?)$/i.test(normSrc)) {
+    return true;
+  }
+  if (/^(?:\/(?:home|users|etc)|[a-zA-Z]:\/(?:users|windows|system32))(?:\/[^/\s]+)?\/?$/i.test(normSrc)) {
+    return true;
   }
   return false;
 }

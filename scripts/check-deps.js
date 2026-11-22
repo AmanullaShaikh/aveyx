@@ -325,7 +325,7 @@ export function checkDependencies(projectDir = process.cwd()) {
   if (fs.existsSync(cargoPath)) {
     try {
       const raw = fs.readFileSync(cargoPath, "utf-8");
-      const depBlock = raw.match(/\[(?:dev-)?dependencies\]([\s\S]*?)(?=\n\[|$)/g) || [];
+      const depBlock = raw.match(/\[(?:workspace\.)?(?:dev-|build-)?dependencies\]([\s\S]*?)(?=\n\[|$)/g) || [];
       for (const blk of depBlock) {
         for (const m of blk.matchAll(/^\s*([a-zA-Z0-9_-]+)\s*=/gm)) {
           const crateName = m[1];

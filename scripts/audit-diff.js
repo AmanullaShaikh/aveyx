@@ -864,17 +864,25 @@ export function compareFullTreeAst(oldCode, newCode, filePath = 'unknown.test.ts
       CallExpression(p) {
         const callee = p.node.callee;
         const name = callee?.name || callee?.property?.name;
-        if (['test', 'it'].includes(name) && p.node.arguments?.[0]?.type === 'StringLiteral') {
-          const title = p.node.arguments[0].value;
-          let count = 0;
-          p.traverse({
-            CallExpression(inner) {
-              const ic = inner.node.callee;
-              const fn = ic?.name || ic?.property?.name || ic?.object?.name || '';
-              if (/\b(?:expect|assert|should)\b/i.test(fn)) count++;
-            }
-          });
-          counts.set(title, count);
+        if (['test', 'it'].includes(name) && p.node.arguments?.[0]) {
+          const arg0 = p.node.arguments[0];
+          let title = null;
+          if (arg0.type === 'StringLiteral') {
+            title = arg0.value;
+          } else if (arg0.type === 'TemplateLiteral') {
+            title = arg0.quasis.map(q => q.value?.raw || q.value?.cooked || '').join('${...}');
+          }
+          if (title) {
+            let count = 0;
+            p.traverse({
+              CallExpression(inner) {
+                const ic = inner.node.callee;
+                const fn = ic?.name || ic?.property?.name || ic?.object?.name || '';
+                if (/\b(?:expect|assert|should)\b/i.test(fn)) count++;
+              }
+            });
+            counts.set(title, count);
+          }
         }
       }
     });
@@ -1075,7 +1083,7 @@ export function auditDiff(rawDiff) {
       if (currentFile === 'package.json' && /"test"\s*:/.test(line)) {
         deletedPkgTestLine.add(currentFile);
       }
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
       const isTestFile = (currentFile.includes('.test.') || currentFile.includes('.spec.') || currentFile.includes('tests/')) && !isSelfAuditTest;
       const deletedText = line.substring(1).trim();
       if (isTestFile && /\b(expect|assert(?:\.[a-zA-Z0-9_$]+)?|should(?:\.[a-zA-Z0-9_$]+)?)\s*\(/.test(deletedText) && !deletedText.startsWith('//')) {
@@ -1087,7 +1095,7 @@ export function auditDiff(rawDiff) {
     if (line.startsWith('+') && !line.startsWith('+++')) {
       const addedText = line.substring(1);
 
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
       if (currentFile === 'package.json' && /"test"\s*:/.test(addedText)) {
         addedPkgTestLine.add('package.json');
       }

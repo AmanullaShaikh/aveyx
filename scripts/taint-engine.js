@@ -24,7 +24,7 @@ function getMemberChain(node) {
       parts.unshift(cur.name);
       break;
     }
-    if (cur.type === 'MemberExpression') {
+    if (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') {
       const prop = cur.property?.name || cur.property?.value;
       if (!prop) return null;
       parts.unshift(String(prop));
@@ -61,7 +61,7 @@ export function isSanitizerCall(node) {
 
 export function isDirectTaintSource(node) {
   if (!node) return false;
-  if (node.type === 'MemberExpression') {
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
     const chain = getMemberChain(node);
     if (!chain || chain.length < 2) return false;
     if (TAINT_SOURCE_ROOTS.has(chain[0]) && TAINT_SOURCE_PROPS.has(chain[1])) return true;
@@ -74,7 +74,7 @@ export function isDirectTaintSource(node) {
     if (chain[0] === 'document' && (chain[1] === 'cookie' || chain[1] === 'URL' || chain[1] === 'referrer')) return true;
     if ((chain[0] === 'event' || chain[0] === 'e') && chain[1] === 'data') return true;
   }
-  if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression') {
+  if ((node.type === 'CallExpression' || node.type === 'OptionalCallExpression') && (node.callee?.type === 'MemberExpression' || node.callee?.type === 'OptionalMemberExpression')) {
     const chain = getMemberChain(node.callee);
     if (chain && chain[chain.length - 1] === 'get' && /searchParams/i.test(chain.join('.'))) {
       return true;
@@ -113,7 +113,7 @@ function exprUsesParamOrSource(node, paramIndexMap, fnMap, visited = new Set(), 
     return { fromSource: false, fromParams: new Set(), hasSqlConcat: false };
   }
 
-  if (node.type === 'MemberExpression') {
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
     const rootChain = getMemberChain(node);
     if (rootChain && paramIndexMap.has(rootChain[0])) {
       return { fromSource: false, fromParams: new Set([paramIndexMap.get(rootChain[0])]), hasSqlConcat: false };
@@ -272,7 +272,7 @@ export function isGuardedByDominatingBranch(callPath, targetNode) {
   const collectIds = (n) => {
     if (!n) return;
     if (n.type === 'Identifier') targetNames.add(n.name);
-    else if (n.type === 'MemberExpression') { collectIds(n.object); collectIds(n.property); }
+    else if (n.type === 'MemberExpression' || n.type === 'OptionalMemberExpression') { collectIds(n.object); collectIds(n.property); }
     else if (n.type === 'BinaryExpression') { collectIds(n.left); collectIds(n.right); }
     else if (n.type === 'TemplateLiteral') (n.expressions || []).forEach(collectIds);
   };
@@ -288,7 +288,7 @@ export function isGuardedByDominatingBranch(callPath, targetNode) {
       const mentionsTarget = (node) => {
         if (!node) return false;
         if (node.type === 'Identifier') return targetNames.has(node.name);
-        if (node.type === 'MemberExpression') return mentionsTarget(node.object) || mentionsTarget(node.property);
+        if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') return mentionsTarget(node.object) || mentionsTarget(node.property);
         return false;
       };
       const checkTestNode = (tn) => {
@@ -463,7 +463,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
       return isExprTainted(node.arguments[0], scope, visited);
     }
 
-    if (node.type === 'MemberExpression') {
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
       const propKey = node.property?.name || node.property?.value;
       if (propKey && node.object?.type === 'Identifier') {
         let objBinding = scope?.getBinding(node.object.name);
@@ -474,7 +474,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
         }
         if (objBinding?.referencePaths) {
           for (const ref of objBinding.referencePaths) {
-            if (ref.parentPath?.isMemberExpression() && ref.parentPath.parentPath?.isAssignmentExpression()) {
+            if ((ref.parentPath?.isMemberExpression() || ref.parentPath?.isOptionalMemberExpression()) && ref.parentPath.parentPath?.isAssignmentExpression()) {
               const assign = ref.parentPath.parentPath;
               if (assign.node.left === ref.parentPath.node) {
                 const assignedProp = ref.parentPath.node.property?.name || ref.parentPath.node.property?.value;
@@ -528,35 +528,14 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
     return { tainted: false, sqlConcat: false };
   }
 
-  try {
-    traverse(ast, {
-      JSXAttribute(p) {
-        if (p.node.name?.name === 'dangerouslySetInnerHTML' && p.node.value?.type === 'JSXExpressionContainer') {
-          const expr = p.node.value.expression;
-          if (expr?.type === 'ObjectExpression') {
-            for (const prop of expr.properties || []) {
-              if ((prop.key?.name || prop.key?.value) === '__html' && isExprTainted(prop.value, p.scope).tainted) {
-                issues.push({
-                  file: filePath,
-                  line: p.node.loc?.start?.line || 1,
-                  severity: 'HIGH',
-                  category: 'XSS',
-                  type: 'XSS',
-                  message: 'Unsanitized tainted value passed to dangerouslySetInnerHTML.__html (React XSS).'
-                });
-              }
-            }
-          }
-        }
-      },
-
-      CallExpression(p) {
-        const line = p.node.loc?.start?.line || 1;
-        const callee = p.node.callee;
-        const propName = callee.type === 'MemberExpression' ? (callee.property?.name || callee.property?.value) : null;
-        const objName = callee.type === 'MemberExpression' ? callee.object?.name : null;
-        const memberChain = callee.type === 'MemberExpression' ? getMemberChain(callee) : null;
-        const fnName = callee.type === 'Identifier' ? callee.name : null;
+  function handleCall(p) {
+    const line = p.node.loc?.start?.line || 1;
+    const callee = p.node.callee;
+    const isMemberLike = callee.type === 'MemberExpression' || callee.type === 'OptionalMemberExpression';
+    const propName = isMemberLike ? (callee.property?.name || callee.property?.value) : null;
+    const objName = isMemberLike ? callee.object?.name : null;
+    const memberChain = isMemberLike ? getMemberChain(callee) : null;
+    const fnName = callee.type === 'Identifier' ? callee.name : null;
 
         // 1. Command Injection: exec, execSync, execa, execaSync, shelljs.exec, renamed destructured aliases
         if (
@@ -808,7 +787,32 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
             }
           }
         }
+  }
+
+  try {
+    traverse(ast, {
+      JSXAttribute(p) {
+        if (p.node.name?.name === 'dangerouslySetInnerHTML' && p.node.value?.type === 'JSXExpressionContainer') {
+          const expr = p.node.value.expression;
+          if (expr?.type === 'ObjectExpression') {
+            for (const prop of expr.properties || []) {
+              if ((prop.key?.name || prop.key?.value) === '__html' && isExprTainted(prop.value, p.scope).tainted) {
+                issues.push({
+                  file: filePath,
+                  line: p.node.loc?.start?.line || 1,
+                  severity: 'HIGH',
+                  category: 'XSS',
+                  type: 'XSS',
+                  message: 'Unsanitized tainted value passed to dangerouslySetInnerHTML.__html (React XSS).'
+                });
+              }
+            }
+          }
+        }
       },
+
+      CallExpression: handleCall,
+      OptionalCallExpression: handleCall,
 
       NewExpression(p) {
         const isFunctionCtor = p.node.callee?.type === 'Identifier' && p.node.callee.name === 'Function';

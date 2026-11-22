@@ -236,8 +236,8 @@ function evaluateBashCommand(rawCmd, depth = 0) {
       if (!subV.allow) return subV;
     }
   }
-  if (/\bprintenv\b[^\n]*\|\s*(?:curl|wget|nc)\b/i.test(preprocessed)) {
-    return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Environment Secret Exfiltration (printenv | curl): "${rawCmd.slice(0, 120)}"` };
+  if (/\b(?:printenv|env)\b[^\n]*\|\s*(?:curl|wget|nc)\b/i.test(preprocessed)) {
+    return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Environment Secret Exfiltration (env/printenv | curl): "${rawCmd.slice(0, 120)}"` };
   }
   if (/\b(?:chmod\s+-R\s+777\s+\/|mkfs(?:\.[a-z0-9]+)?\s+\/dev\/|dd\b[^\r\n]*\bof=\/dev\/(?:sd|nvme|hd|disk)|Remove-Item\b[^\r\n]*(?:-Recurse|-Force)[^\r\n]*(?:C:\\|\/\s*$|\*))/i.test(preprocessed)) {
     return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Destructive Disk/Permission Command: "${rawCmd.slice(0, 120)}"` };
@@ -388,7 +388,9 @@ function evaluateBashCommand(rawCmd, depth = 0) {
         const hasPlusRefspec = positionals.some(p => p.startsWith('+') && PROTECTED_BRANCH_RE.test(p.includes(':') ? p.split(':').pop() : p.slice(1)));
         const hasColonDelete = positionals.some(p => p.startsWith(':') && PROTECTED_BRANCH_RE.test(p.slice(1)));
 
-        if (hasPlusRefspec || hasColonDelete || (hasDelete && targetsProtectedRef) || (hasForce && (targetsProtectedRef || positionals.length <= 1))) {
+        const hasColonAllMatching = positionals.some(p => p === ':');
+
+        if (hasPlusRefspec || hasColonDelete || (hasDelete && targetsProtectedRef) || (hasForce && (targetsProtectedRef || positionals.length <= 1 || hasColonAllMatching))) {
           return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Destructive Force Push / Protected Branch Delete: "${rawCmd.slice(0, 120)}"` };
         }
       }
