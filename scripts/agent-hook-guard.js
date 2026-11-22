@@ -25,8 +25,9 @@ const PROTECTED_BRANCH_RE = /^(?:refs\/heads\/)?(?:main|master|prod|production)$
  */
 function preprocessShell(rawCmd) {
   let s = String(rawCmd || '');
-  // Join backslash-newline line continuations
+  // Join backslash-newline line continuations & normalize $IFS word-splitting evasion
   s = s.replace(/\\\r?\n/g, ' ');
+  s = s.replace(/\$\{?IFS\}?/g, ' ');
   // Decode ANSI-C hex escapes ($'\x2d\x2dno-verify')
   s = s.replace(/\$'([^']+)'/g, (_, inner) =>
     inner.replace(/\\x([0-9a-fA-F]{2})/g, (__, h) => String.fromCharCode(parseInt(h, 16)))
@@ -123,6 +124,14 @@ function tokenizeShellSegments(cmdStr) {
       i++;
       continue;
     }
+    if (ch === '&') {
+      flushSegment('&');
+      continue;
+    }
+    if (ch === '(' || ch === ')') {
+      flushSegment(ch);
+      continue;
+    }
     if (ch === '|') {
       flushSegment('|');
       continue;
@@ -138,7 +147,7 @@ function tokenizeShellSegments(cmdStr) {
 }
 
 function isSensitivePathToken(rawPath) {
-  const cleaned = String(rawPath || '').replace(/^[<>]+/, '').replace(/\\/g, '/').trim();
+  const cleaned = String(rawPath || '').replace(/^[$(<`]+/, '').replace(/[)>`;]+$/, '').replace(/\\/g, '/').trim();
   if (!cleaned) return false;
   if (SENSITIVE_GLOB_RE.test(cleaned)) return true;
   if (SENSITIVE_FULLPATH_RE.test(cleaned)) return true;
@@ -162,7 +171,7 @@ function stripEnvPrefix(tokens) {
       idx++;
       continue;
     }
-    if (v === 'sudo' || v === 'command' || v === 'env') {
+    if (['sudo', 'command', 'env', 'time', 'nohup', 'nice', 'builtin', 'exec', 'then', 'do', 'else', 'elif', 'if', '!'].includes(v)) {
       idx++;
       while (idx < tokens.length && tokens[idx].value.startsWith('-')) idx++;
       continue;
@@ -172,7 +181,8 @@ function stripEnvPrefix(tokens) {
   return tokens.slice(idx);
 }
 
-function evaluateBashCommand(rawCmd) {
+function evaluateBashCommand(rawCmd, depth = 0) {
+  if (depth > 3) return { allow: true };
   const preprocessed = preprocessShell(rawCmd);
   const segments = tokenizeShellSegments(preprocessed);
 
@@ -185,6 +195,16 @@ function evaluateBashCommand(rawCmd) {
   }
   if (/\b(?:sh|bash|zsh|dash|source|\.)\s+(?:-c\s+)?["']?(?:<\(|\$\()\s*(?:curl|wget)\b/i.test(preprocessed)) {
     return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Remote Script Execution (process/command substitution): "${rawCmd.slice(0, 120)}"` };
+  }
+  for (const subM of preprocessed.matchAll(/\$\(\s*<\s*([^\s)]+)\s*\)|`([^\`]+)`/g)) {
+    const target = subM[1] || subM[2];
+    if (subM[1] && isSensitivePathToken(subM[1])) {
+      return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Subshell Credential Read ($(<${subM[1]})): "${rawCmd.slice(0, 120)}"` };
+    }
+    if (subM[2]) {
+      const subV = evaluateBashCommand(subM[2], depth + 1);
+      if (!subV.allow) return subV;
+    }
   }
   if (/\bprintenv\b[^\n]*\|\s*(?:curl|wget|nc)\b/i.test(preprocessed)) {
     return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Environment Secret Exfiltration (printenv | curl): "${rawCmd.slice(0, 120)}"` };
@@ -226,6 +246,18 @@ function evaluateBashCommand(rawCmd) {
             return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Remote Pipe-to-Interpreter (${cmdBase} | ${nextBin}): "${rawCmd.slice(0, 120)}"` };
           }
         }
+      }
+    }
+
+    // Recursive shell wrapper evaluation: bash -c "git commit --no-verify", eval "..."
+    if (/^(?:sh|bash|zsh|dash|ksh|eval)$/.test(cmdBase)) {
+      const cIdx = toks.findIndex((t, ti) => ti > 0 && (t.value === '-c' || t.value === '-lc'));
+      const innerCmd = cmdBase === 'eval'
+        ? toks.slice(1).map(t => t.value).join(' ')
+        : (cIdx !== -1 && toks[cIdx + 1] ? toks[cIdx + 1].value : null);
+      if (innerCmd) {
+        const subVerdict = evaluateBashCommand(innerCmd, depth + 1);
+        if (!subVerdict.allow) return subVerdict;
       }
     }
 
@@ -293,11 +325,11 @@ function evaluateBashCommand(rawCmd) {
         for (let j = 0; j < subArgs.length; j++) {
           const t = subArgs[j];
           // Skip values of -m / --message / -F / -C so commit messages like "fix -n flag" NEVER false-positive!
-          if (!t.quoted && (t.value === '-m' || t.value === '--message' || t.value === '-F' || t.value === '--file')) {
-            j++;
+          if (t.value === '-m' || t.value === '--message' || t.value === '-F' || t.value === '--file' || /^--message=/.test(t.value)) {
+            if (!t.value.startsWith('--message=')) j++;
             continue;
           }
-          if (!t.quoted && t.value.startsWith('-')) {
+          if (t.value.startsWith('-')) {
             if (/^--no-ver(?:i(?:f(?:y)?)?)?$/i.test(t.value) || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(t.value)) {
               return { allow: false, reason: `[Aveyx Runtime Guard] Blocked Git Hook Bypass (${t.value}): "${rawCmd.slice(0, 120)}"` };
             }

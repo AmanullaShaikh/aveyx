@@ -528,16 +528,20 @@ function astAuditTestSnippet(file, code) {
           }
         }
         // 1b. Self-Mocking Unit Under Test (vi.mock / jest.mock / jest["mock"] / aliased m = jest.mock / mock.module)
-        const isMockMember = (c) =>
-          c?.type === 'MemberExpression' &&
-          c.object?.type === 'Identifier' &&
-          ['vi', 'jest', 'mock'].includes(c.object.name) &&
-          ['mock', 'doMock', 'module'].includes(c.property?.name || c.property?.value);
+        const isMockMember = (c, propPath = null) => {
+          if (c?.type !== 'MemberExpression' || c.object?.type !== 'Identifier' || !['vi', 'jest', 'mock'].includes(c.object.name)) return false;
+          let propVal = c.property?.name || c.property?.value;
+          if (!propVal && propPath) {
+            const ev = propPath.evaluate?.();
+            if (ev?.confident && typeof ev.value === 'string') propVal = ev.value;
+          }
+          return ['mock', 'doMock', 'module'].includes(propVal);
+        };
         const isAliasedMockCall = callee?.type === 'Identifier' && (() => {
           const b = p.scope?.getBinding(callee.name);
           return Boolean(b?.path?.node?.init && isMockMember(b.path.node.init));
         })();
-        if (isMockMember(callee) || isAliasedMockCall) {
+        if (isMockMember(callee, p.get('callee.property')) || isAliasedMockCall) {
           const firstArg = p.node.arguments?.[0];
           let mockTargetStr = null;
           if (firstArg?.type === 'StringLiteral' && firstArg.value) {
@@ -548,6 +552,9 @@ function astAuditTestSnippet(file, code) {
             mockTargetStr = firstArg.source.value;
           } else if (firstArg?.type === 'CallExpression' && firstArg.callee?.type === 'Import' && firstArg.arguments?.[0]?.type === 'StringLiteral') {
             mockTargetStr = firstArg.arguments[0].value;
+          } else if (firstArg) {
+            const evArg = p.get('arguments.0')?.evaluate?.();
+            if (evArg?.confident && typeof evArg.value === 'string') mockTargetStr = evArg.value;
           }
           if (mockTargetStr) {
             const testBase = file.split('/').pop().replace(/\.(test|spec)\.[a-z0-9]+$/i, '').toLowerCase();
@@ -616,9 +623,10 @@ function astAuditTestSnippet(file, code) {
             const k2 = getSimpleNodeKey(rhs);
             const lhsRaw = lhs && typeof lhs.start === 'number' && typeof lhs.end === 'number' ? code.slice(lhs.start, lhs.end).replace(/\s+/g, '') : null;
             const rhsRaw = rhs && typeof rhs.start === 'number' && typeof rhs.end === 'number' ? code.slice(rhs.start, rhs.end).replace(/\s+/g, '') : null;
-            const lhsConst = lhs?.type === 'BinaryExpression' && p.get('callee.object.arguments.0')?.evaluate?.()?.confident;
-            const rhsConst = isLiteralNode(rhs) || (rhs?.type === 'BinaryExpression' && p.get('arguments.0')?.evaluate?.()?.confident);
-            if ((k1 && k2 && k1 === k2) || (lhsRaw && rhsRaw && lhsRaw === rhsRaw) || (lhsConst && rhsConst)) {
+            const lhsEval = lhs?.type === 'BinaryExpression' ? p.get('callee.object.arguments.0')?.evaluate?.() : null;
+            const rhsEval = (isLiteralNode(rhs) || rhs?.type === 'BinaryExpression') ? p.get('arguments.0')?.evaluate?.() : null;
+            const isConstTautology = Boolean(lhsEval?.confident && rhsEval?.confident && lhsEval.value === rhsEval.value);
+            if ((k1 && k2 && k1 === k2) || (lhsRaw && rhsRaw && lhsRaw === rhsRaw) || isConstTautology) {
               astIssues.push({
                 severity: 'CRITICAL',
                 category: 'TEST_TAMPERING',
@@ -946,6 +954,7 @@ export function auditDiff(rawDiff) {
   const fileStringVars = new Map();
   const testAddedSnippets = new Map();
   const deletedPkgTestLine = new Set();
+  const addedPkgTestLine = new Set();
   let inTestOptionsBlock = false;
   let testOptionsDepth = 0;
   let helperFnDepth = 0;
@@ -1011,6 +1020,9 @@ export function auditDiff(rawDiff) {
       const addedText = line.substring(1);
 
       const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
+      if (currentFile === 'package.json' && /"test"\s*:/.test(addedText)) {
+        addedPkgTestLine.add('package.json');
+      }
       if (currentFile === 'package.json' && /"test"\s*:\s*"(?:echo\b|true\b|exit\s+0|:|\s*node\s+-e\s+['"]?(?:0|process\.exit\(0\)|;?)['"]?|.*(?:\|\||\||;|&&|&)\s*(?:exit\s+[0-9]+|true\b|:))/i.test(addedText)) {
         issues.push({
           severity: 'CRITICAL',
@@ -1230,6 +1242,17 @@ export function auditDiff(rawDiff) {
         issues.push(af);
       }
     }
+  }
+
+  // Catch complete deletion of package.json "test" script
+  if (deletedPkgTestLine.has('package.json') && !addedPkgTestLine.has('package.json')) {
+    issues.push({
+      severity: 'CRITICAL',
+      category: 'TEST_TAMPERING',
+      file: 'package.json',
+      description: 'AI Agent Deleted "test" Script from package.json',
+      snippet: '- "test": ...'
+    });
   }
 
   // Reconcile deleted assertions strictly within the SAME file (prevents cross-file assertion smuggling)

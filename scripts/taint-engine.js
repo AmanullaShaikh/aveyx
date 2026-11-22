@@ -498,7 +498,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
           ['readFile', 'writeFile', 'appendFile', 'unlink', 'open'].includes(memberChain[2]);
         if (
           !isTestFile &&
-          ((objName === 'fs' && ['readFile', 'readFileSync', 'writeFile', 'writeFileSync', 'createReadStream'].includes(propName)) ||
+          ((objName === 'fs' && ['readFile', 'readFileSync', 'writeFile', 'writeFileSync', 'createReadStream', 'open', 'openSync', 'appendFile', 'appendFileSync', 'unlink', 'unlinkSync'].includes(propName)) ||
            isFsPromises ||
            (fnName && namedFsFns.has(fnName)) ||
            ((propName === 'sendFile' || propName === 'download') && ['res', 'reply'].includes(objName)))
@@ -533,7 +533,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
             });
           }
         }
-        if (!isTestFile && (fnName === 'axios' || fnName === 'got') && p.node.arguments[0]?.type === 'ObjectExpression') {
+        if (!isTestFile && (fnName === 'axios' || fnName === 'got' || (objName === 'axios' && propName === 'request')) && p.node.arguments[0]?.type === 'ObjectExpression') {
           for (const prop of p.node.arguments[0].properties || []) {
             const k = prop.key?.name || prop.key?.value;
             if ((k === 'url' || k === 'baseURL') && isExprTainted(prop.value, p.scope).tainted) {
@@ -568,8 +568,11 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
         }
 
         // 5. NoSQL Injection: direct req.body, aliased filter, $where, AND ObjectExpression property value tainted ({ u: req.body.u })
-        if (!isTestFile && propName && ['find', 'findOne', 'findOneAndUpdate', 'deleteMany', 'updateMany'].includes(propName)) {
-          const arg0 = p.node.arguments[0];
+        if (!isTestFile && propName && ['find', 'findOne', 'findOneAndUpdate', 'deleteMany', 'updateMany', 'updateOne', 'deleteOne', 'countDocuments', 'replaceOne'].includes(propName)) {
+          const nosqlArgs = ['updateOne', 'updateMany', 'findOneAndUpdate', 'replaceOne'].includes(propName)
+            ? [p.node.arguments[0], p.node.arguments[1]].filter(Boolean)
+            : [p.node.arguments[0]].filter(Boolean);
+          for (const arg0 of nosqlArgs) {
           if (arg0 && (isDirectTaintSource(arg0) || (arg0.type === 'Identifier' && isExprTainted(arg0, p.scope).tainted))) {
             issues.push({
               file: filePath,
@@ -603,6 +606,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
                 break;
               }
             }
+          }
           }
         }
 
@@ -658,7 +662,8 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
             a?.type === 'ObjectExpression' &&
             a.properties?.some(pr => (pr.key?.name || pr.key?.value) === 'shell' && pr.value?.type === 'BooleanLiteral' && pr.value.value === true)
           );
-          if ((arg0 && arg0.type !== 'StringLiteral' && isExprTainted(arg0, p.scope).tainted) || (hasShellTrue && arg1 && isExprTainted(arg1, p.scope).tainted)) {
+          const isShellBinLiteral = arg0?.type === 'StringLiteral' && /^(?:bash|sh|zsh|dash|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)$/i.test(arg0.value.split(/[\\/]/).pop());
+          if ((arg0 && arg0.type !== 'StringLiteral' && isExprTainted(arg0, p.scope).tainted) || ((hasShellTrue || isShellBinLiteral) && arg1 && isExprTainted(arg1, p.scope).tainted)) {
             issues.push({
               file: filePath,
               line,
@@ -673,11 +678,14 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
         // 8b. Reflected HTML XSS in res.send / res.end
         if (!isTestFile && (propName === 'send' || propName === 'end') && ['res', 'reply'].includes(objName)) {
           const arg0 = p.node.arguments[0];
-          const hasHtmlTag =
-            (arg0?.type === 'TemplateLiteral' && /<[a-z][^>]*>/i.test(arg0.quasis.map(q => q.value.raw).join(''))) ||
-            (arg0?.type === 'BinaryExpression' && arg0.operator === '+' &&
-              ((arg0.left?.type === 'StringLiteral' && /<[a-z][^>]*>/i.test(arg0.left.value)) ||
-               (arg0.right?.type === 'StringLiteral' && /<[a-z][^>]*>/i.test(arg0.right.value))));
+          const collectStaticStrs = (n) => {
+            if (!n) return '';
+            if (n.type === 'StringLiteral') return n.value;
+            if (n.type === 'TemplateLiteral') return n.quasis.map(q => q.value.raw).join('');
+            if (n.type === 'BinaryExpression' && n.operator === '+') return collectStaticStrs(n.left) + collectStaticStrs(n.right);
+            return '';
+          };
+          const hasHtmlTag = /<[a-z\/][^>]*>/i.test(collectStaticStrs(arg0));
           if (hasHtmlTag && isExprTainted(arg0, p.scope).tainted) {
             issues.push({
               file: filePath,
@@ -734,13 +742,15 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
       },
 
       AssignmentExpression(p) {
+        const isDangerousProtoKey = (propNode) =>
+          (propNode?.type === 'StringLiteral' && ['__proto__', 'prototype', 'constructor'].includes(propNode.value)) ||
+          (propNode?.type === 'Identifier' && ['__proto__', 'prototype', 'constructor'].includes(propNode.name));
         if (
           !isTestFile &&
           p.node.left?.type === 'MemberExpression' &&
           p.node.left.computed &&
           p.node.left.object?.type === 'MemberExpression' &&
-          p.node.left.object.computed &&
-          isExprTainted(p.node.left.object.property, p.scope).tainted &&
+          (isExprTainted(p.node.left.object.property, p.scope).tainted || isDangerousProtoKey(p.node.left.object.property)) &&
           isExprTainted(p.node.left.property, p.scope).tainted
         ) {
           issues.push({

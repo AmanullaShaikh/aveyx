@@ -48,6 +48,8 @@ export const DEFAULT_BABEL_PLUGINS = [
 export function parseBabelAst(code, extraOptions = {}) {
   return babelParse(code, {
     sourceType: 'module',
+    allowReturnOutsideFunction: true,
+    errorRecovery: true,
     plugins: DEFAULT_BABEL_PLUGINS,
     ...extraOptions
   });

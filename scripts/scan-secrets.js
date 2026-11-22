@@ -43,7 +43,8 @@ const SELF_EXCLUDED_PATHS = new Set([
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-phase2-p1.test.js')),
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-phase3-p2.test.js')),
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-triple-loop-breaker.test.js')),
-  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-claude-audit-remediation.test.js'))
+  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-claude-audit-remediation.test.js')),
+  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-codex-audit-remediation.test.js'))
 ]);
 
 export function shannonEntropy(str) {
