@@ -142,6 +142,34 @@ function isOverprivilegedMountArg(arg) {
  * hidden prompt-injection in ANY string leaf (name, title, description, schema),
  * multi-layer encoding, homoglyphs, and case-insensitive cross-server tool shadowing.
  */
+
+/**
+ * Runtime MCP message interceptor/filter for live tools/call responses.
+ * Scans dynamic tool outputs for indirect prompt injection, steganography, and oversized smuggling.
+ */
+export function auditMcpRuntimePayload(jsonRpcMsg, serverName = 'runtime-mcp') {
+  const issues = [];
+  const leaves = collectStringLeaves(jsonRpcMsg);
+  const matched = new Set();
+  for (const leaf of leaves) {
+    for (const v of decodeMultiLayer(leaf)) {
+      for (const pat of POISONING_PATTERNS) {
+        if (!matched.has(pat.name) && pat.regex.test(v)) {
+          matched.add(pat.name);
+          issues.push({
+            severity: 'CRITICAL',
+            category: 'MCP_RUNTIME_INDIRECT_INJECTION',
+            server: serverName,
+            file: 'runtime:payload',
+            message: `Runtime MCP response from "${serverName}" contains indirect prompt injection (${pat.name}).`
+          });
+        }
+      }
+    }
+  }
+  return { safe: issues.length === 0, issues };
+}
+
 export function auditMcpToolDefinitions(serverToolsMap = {}) {
   const issues = [];
   const seenToolOwner = new Map();

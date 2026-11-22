@@ -21,6 +21,57 @@ const c = {
 
 const IGNORED = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.agents', '.worktrees', 'coverage']);
 
+
+const workspacePkgCache = new Map();
+
+export function loadWorkspacePackages(rootDir) {
+  const absRoot = path.resolve(rootDir);
+  if (workspacePkgCache.has(absRoot)) return workspacePkgCache.get(absRoot);
+
+  const pkgMap = new Map(); // pkgName -> abs entry path
+  const patterns = [];
+
+  const rootPkgPath = path.join(absRoot, "package.json");
+  if (fs.existsSync(rootPkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(rootPkgPath, "utf-8"));
+      if (Array.isArray(pkg.workspaces)) patterns.push(...pkg.workspaces);
+      else if (Array.isArray(pkg.workspaces?.packages)) patterns.push(...pkg.workspaces.packages);
+    } catch {}
+  }
+
+  const pnpmWsPath = path.join(absRoot, "pnpm-workspace.yaml");
+  if (fs.existsSync(pnpmWsPath)) {
+    try {
+      const raw = fs.readFileSync(pnpmWsPath, "utf-8");
+      for (const m of raw.matchAll(/^\s*-\s*['"]?([^\s'"#]+)['"]?/gm)) {
+        patterns.push(m[1]);
+      }
+    } catch {}
+  }
+
+  for (const pat of patterns) {
+    const clean = pat.replace(/\/\*\*?$/, "").replace(/\/+$/, "");
+    const baseDir = path.join(absRoot, clean);
+    if (!fs.existsSync(baseDir) || !fs.statSync(baseDir).isDirectory()) continue;
+    for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const subDir = path.join(baseDir, entry.name);
+      const subPkg = path.join(subDir, "package.json");
+      if (!fs.existsSync(subPkg)) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(subPkg, "utf-8"));
+        if (!meta.name) continue;
+        const entryRel = typeof meta.main === "string" ? meta.main : "src/index.ts";
+        pkgMap.set(meta.name, { dir: subDir, entry: path.resolve(subDir, entryRel) });
+      } catch {}
+    }
+  }
+
+  workspacePkgCache.set(absRoot, pkgMap);
+  return pkgMap;
+}
+
 const tsConfigCache = new Map();
 
 function stripJsonCommentsAndTrailingCommas(raw) {
@@ -194,6 +245,20 @@ export function resolveImportPath(sourceFile, importString, rootDir, tsConfig = 
           const mapped = rule.hasStar ? target.replace("*", wildcard) : target;
           const candidateAbs = path.resolve(cfg.baseDir, mapped);
           const hit = tryResolveFileOnDisk(candidateAbs, rootDir);
+          if (hit) return { type: 'internal', path: hit };
+        }
+      }
+    }
+    // Monorepo workspace package cross-linking (@acme/shared or @acme/shared/utils)
+    const wsPkgs = loadWorkspacePackages(rootDir);
+    if (wsPkgs.size > 0) {
+      for (const [pkgName, info] of wsPkgs.entries()) {
+        if (importString === pkgName) {
+          const hit = tryResolveFileOnDisk(info.entry, rootDir) || tryResolveFileOnDisk(path.join(info.dir, "src/index"), rootDir) || tryResolveFileOnDisk(path.join(info.dir, "index"), rootDir);
+          if (hit) return { type: 'internal', path: hit };
+        } else if (importString.startsWith(pkgName + "/")) {
+          const sub = importString.slice(pkgName.length + 1);
+          const hit = tryResolveFileOnDisk(path.join(info.dir, sub), rootDir) || tryResolveFileOnDisk(path.join(info.dir, "src", sub), rootDir);
           if (hit) return { type: 'internal', path: hit };
         }
       }

@@ -43,8 +43,7 @@ const SELF_EXCLUDED_PATHS = new Set([
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-phase2-p1.test.js')),
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-phase3-p2.test.js')),
   safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-triple-loop-breaker.test.js')),
-  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-claude-audit-remediation.test.js')),
-  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-codex-audit-remediation.test.js'))
+  safeRealpath(path.join(ROOT_DIR, 'tests', 'v4-claude-audit-remediation.test.js'))
 ]);
 
 export function shannonEntropy(str) {
@@ -67,6 +66,8 @@ function isLikelySafeNonSecret(val) {
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) return true; // UUID
   if (/^(?:example|placeholder|your[_-]|changeme|dummy|test[_-]|xxxx|0000|1234)/i.test(val)) return true;
   if (/\s/.test(val)) return true;
+  // Reject pure alphabetic multi-word CamelCase identifiers (e.g. thisIsAVeryLongCamelCaseIdentifier)
+  if (/^[A-Za-z]+$/.test(val) && (val.match(/[a-z][A-Z]/g) || []).length >= 3) return true;
   return false;
 }
 

@@ -232,13 +232,24 @@ const TOOLS = [
   }
 ];
 
+let useContentLengthFraming = false;
+
+function writeFramedPayload(jsonStr) {
+  if (useContentLengthFraming) {
+    const byteLen = Buffer.byteLength(jsonStr, 'utf-8');
+    process.stdout.write(`Content-Length: ${byteLen}\r\n\r\n${jsonStr}`);
+  } else {
+    process.stdout.write(jsonStr + '\n');
+  }
+}
+
 function sendResponse(id, result) {
   const payload = JSON.stringify({
     jsonrpc: '2.0',
     id,
     result
   });
-  process.stdout.write(payload + '\n');
+  writeFramedPayload(payload);
 }
 
 function sendError(id, code, message) {
@@ -247,10 +258,23 @@ function sendError(id, code, message) {
     id,
     error: { code, message }
   });
-  process.stdout.write(payload + '\n');
+  writeFramedPayload(payload);
 }
 
-// Stdio JSON-RPC line parser
+function dispatchJsonText(trimmed) {
+  if (!trimmed) return;
+  try {
+    const message = JSON.parse(trimmed);
+    handleMessage(message).catch((err) => {
+      const msgId = message && typeof message === 'object' && !Array.isArray(message) ? (message.id ?? null) : null;
+      sendError(msgId, -32603, `Internal error: ${err?.message || 'Unknown error'}`);
+    });
+  } catch (err) {
+    sendError(null, -32700, 'Parse error: Invalid JSON was received by the server.');
+  }
+}
+
+// Dual-mode Stdio JSON-RPC parser (Content-Length LSP/MCP framing + newline-delimited JSON)
 const MAX_STDIN_BUFFER_BYTES = 10 * 1024 * 1024;
 let buffer = '';
 
@@ -262,22 +286,28 @@ process.stdin.on('data', (chunk) => {
     sendError(null, -32700, 'Parse error: Input buffer exceeded 10MB limit.');
     return;
   }
-  const lines = buffer.split('\n');
-  buffer = lines.pop(); // Retain incomplete line
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const message = JSON.parse(trimmed);
-      handleMessage(message).catch((err) => {
-        const msgId = message && typeof message === 'object' && !Array.isArray(message) ? (message.id ?? null) : null;
-        sendError(msgId, -32603, `Internal error: ${err?.message || 'Unknown error'}`);
-      });
-    } catch (err) {
-      // Return standard JSON-RPC 2.0 parse error on malformed/garbage input
-      sendError(null, -32700, 'Parse error: Invalid JSON was received by the server.');
+  while (buffer.length > 0) {
+    const clMatch = /^Content-Length:\s*(\d+)\r?\n(?:[^\r\n]+\r?\n)*\r?\n/i.exec(buffer);
+    if (clMatch) {
+      useContentLengthFraming = true;
+      const contentLen = parseInt(clMatch[1], 10);
+      const headerLen = clMatch[0].length;
+      const bodyBuf = Buffer.from(buffer.slice(headerLen), 'utf-8');
+      if (bodyBuf.length < contentLen) break;
+      const jsonPayload = bodyBuf.subarray(0, contentLen).toString('utf-8');
+      buffer = bodyBuf.subarray(contentLen).toString('utf-8');
+      dispatchJsonText(jsonPayload.trim());
+      continue;
     }
+    if (/^Content-Length:/i.test(buffer) && !/\r?\n\r?\n/.test(buffer)) {
+      break;
+    }
+    const nlIdx = buffer.indexOf('\n');
+    if (nlIdx === -1) break;
+    const line = buffer.slice(0, nlIdx);
+    buffer = buffer.slice(nlIdx + 1);
+    dispatchJsonText(line.trim());
   }
 });
 

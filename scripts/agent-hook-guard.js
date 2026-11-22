@@ -32,13 +32,43 @@ function preprocessShell(rawCmd) {
   s = s.replace(/\$'([^']+)'/g, (_, inner) =>
     inner.replace(/\\x([0-9a-fA-F]{2})/g, (__, h) => String.fromCharCode(parseInt(h, 16)))
   );
-  // Resolve simple inline shell variable assignments: F=--no-verify; git commit $F
+  // Recursively substitute safe echo/printf command substitutions: `echo git` or $(echo git)
+  for (let pass = 0; pass < 4; pass++) {
+    const nextS = s.replace(/`([A-Za-z0-9_.\s\/'"-]+)`|\$\(\s*([A-Za-z0-9_.\s\/'"-]+)\s*\)/g, (full, b1, b2) => {
+      const inner = (b1 || b2 || '').trim();
+      const parts = inner.split(/\s+/);
+      if (parts[0] === 'echo' || parts[0] === 'printf') {
+        return parts.slice(1).join(' ').replace(/['"]/g, '');
+      }
+      return full;
+    });
+    if (nextS === s) break;
+    s = nextS;
+  }
+  // Resolve inline shell variable assignments (including export G=git; $G commit -n)
   const vars = new Map();
-  for (const m of s.matchAll(/(?:^|[;&|\n]\s*)([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'([^']*)'|([^\s;&|]+))/g)) {
+  for (const m of s.matchAll(/(?:^|[;&|\n]\s*)(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'([^']*)'|([^\s;&|]+))/g)) {
     vars.set(m[1], m[3] ?? m[4] ?? m[5] ?? '');
   }
   if (vars.size > 0) {
     s = s.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (full, name) => (vars.has(name) ? vars.get(name) : full));
+  }
+  // Expand inline shell function wrappers: g() { git "$@"; }; g commit -n
+  const fnDefs = new Map();
+  s = s.replace(/(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{\s*([^}]+?)\s*\}\s*;?/g, (full, fnName, body) => {
+    fnDefs.set(fnName, body.replace(/;\s*$/, '').trim());
+    return '';
+  });
+  if (fnDefs.size > 0) {
+    for (const [fnName, body] of fnDefs.entries()) {
+      const callRe = new RegExp(`(^|[;&|\\n])\\s*${fnName}\\b([^;&|\\n]*)`, 'g');
+      s = s.replace(callRe, (_, pre, rest) => {
+        const expanded = /"\$@"|\$@|\$\*/.test(body)
+          ? body.replace(/"\$@"|\$@|\$\*/g, rest.trim())
+          : `${body} ${rest.trim()}`;
+        return `${pre}${expanded}`;
+      });
+    }
   }
   // Decode inline base64 payloads
   let decodedAppendix = '';
@@ -325,8 +355,8 @@ function evaluateBashCommand(rawCmd, depth = 0) {
         for (let j = 0; j < subArgs.length; j++) {
           const t = subArgs[j];
           // Skip values of -m / --message / -F / -C so commit messages like "fix -n flag" NEVER false-positive!
-          if (t.value === '-m' || t.value === '--message' || t.value === '-F' || t.value === '--file' || /^--message=/.test(t.value)) {
-            if (!t.value.startsWith('--message=')) j++;
+          if (!t.quoted && (t.value === '-m' || t.value === '--message' || t.value === '-F' || t.value === '--file')) {
+            j++;
             continue;
           }
           if (t.value.startsWith('-')) {

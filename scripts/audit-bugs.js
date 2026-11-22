@@ -5,7 +5,7 @@ import path from 'node:path';
 import { parse } from '@babel/parser';
 import { buildSarifReport } from './audit-diff.js';
 import { resolveImportPath } from './dependency-graph.js';
-import { analyzeInterProceduralTaint, extractFileExportSummaries, isSanitizerCall } from './taint-engine.js';
+import { analyzeInterProceduralTaint, extractFileExportSummaries, isSanitizerCall, isGuardedByDominatingBranch } from './taint-engine.js';
 import _traverse from '@babel/traverse';
 
 const traverse = _traverse.default || _traverse;
@@ -671,7 +671,7 @@ export function auditCodeBugs(code, filePath = 'unknown.ts', options = {}) {
             return false;
           };
 
-          if (isVulnerableSqlExpression(firstArg, p.scope)) {
+          if (!isGuardedByDominatingBranch(p, firstArg) && isVulnerableSqlExpression(firstArg, p.scope)) {
             issues.push({
               file: filePath,
               line: p.node.loc?.start.line || 1,

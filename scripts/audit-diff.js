@@ -838,6 +838,74 @@ function astAuditTestSnippet(file, code) {
   return astIssues;
 }
 
+
+/**
+ * Full-tree semantic AST comparison (HEAD vs Working Tree).
+ * Detects per-test assertion count weakening across whole test files without hunk fragmentation.
+ */
+export function compareFullTreeAst(oldCode, newCode, filePath = 'unknown.test.ts') {
+  const semanticIssues = [];
+  if (!oldCode || !newCode) return semanticIssues;
+  const parseOpts = {
+    sourceType: 'module',
+    allowReturnOutsideFunction: true,
+    errorRecovery: true,
+    plugins: ['typescript', 'jsx', 'classProperties', 'decorators-legacy', 'dynamicImport', 'topLevelAwait']
+  };
+  let oldAst = null;
+  let newAst = null;
+  try { oldAst = parse(oldCode, parseOpts); } catch {}
+  try { newAst = parse(newCode, parseOpts); } catch {}
+  if (!oldAst || !newAst) return semanticIssues;
+
+  const extractAssertionCounts = (ast) => {
+    const counts = new Map();
+    traverse(ast, {
+      CallExpression(p) {
+        const callee = p.node.callee;
+        const name = callee?.name || callee?.property?.name;
+        if (['test', 'it'].includes(name) && p.node.arguments?.[0]?.type === 'StringLiteral') {
+          const title = p.node.arguments[0].value;
+          let count = 0;
+          p.traverse({
+            CallExpression(inner) {
+              const ic = inner.node.callee;
+              const fn = ic?.name || ic?.property?.name || ic?.object?.name || '';
+              if (/\b(?:expect|assert|should)\b/i.test(fn)) count++;
+            }
+          });
+          counts.set(title, count);
+        }
+      }
+    });
+    return counts;
+  };
+
+  const oldCounts = extractAssertionCounts(oldAst);
+  const newCounts = extractAssertionCounts(newAst);
+  for (const [title, oldCount] of oldCounts.entries()) {
+    const newCount = newCounts.get(title);
+    if (newCount === undefined) {
+      semanticIssues.push({
+        severity: 'CRITICAL',
+        category: 'TEST_TAMPERING',
+        file: filePath,
+        description: `Semantic Full-Tree Audit: Test "${title}" was deleted from ${filePath}`,
+        snippet: `deleted test("${title}")`
+      });
+    } else if (newCount < oldCount) {
+      semanticIssues.push({
+        severity: 'CRITICAL',
+        category: 'TEST_TAMPERING',
+        file: filePath,
+        description: `Semantic Full-Tree Audit: Test "${title}" assertions weakened from ${oldCount} down to ${newCount}`,
+        snippet: `test("${title}"): ${oldCount} -> ${newCount} assertions`
+      });
+    }
+  }
+  return semanticIssues;
+}
+
 export function buildSarifReport(issues, toolName = 'aveyx-review', version = '3.0.4') {
   const rulesMap = new Map();
   const results = [];
@@ -1007,7 +1075,7 @@ export function auditDiff(rawDiff) {
       if (currentFile === 'package.json' && /"test"\s*:/.test(line)) {
         deletedPkgTestLine.add(currentFile);
       }
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
       const isTestFile = (currentFile.includes('.test.') || currentFile.includes('.spec.') || currentFile.includes('tests/')) && !isSelfAuditTest;
       const deletedText = line.substring(1).trim();
       if (isTestFile && /\b(expect|assert(?:\.[a-zA-Z0-9_$]+)?|should(?:\.[a-zA-Z0-9_$]+)?)\s*\(/.test(deletedText) && !deletedText.startsWith('//')) {
@@ -1019,7 +1087,7 @@ export function auditDiff(rawDiff) {
     if (line.startsWith('+') && !line.startsWith('+++')) {
       const addedText = line.substring(1);
 
-      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
+      const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.');
       if (currentFile === 'package.json' && /"test"\s*:/.test(addedText)) {
         addedPkgTestLine.add('package.json');
       }

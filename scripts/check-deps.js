@@ -33,7 +33,7 @@ const POPULAR_NPM_PACKAGES = [
   'inquirer', 'ora', 'uuid', 'nanoid', 'dayjs', 'date-fns', 'moment', 'jsonwebtoken',
   'bcrypt', 'bcryptjs', 'cors', 'helmet', 'multer', 'socket.io', 'ws', 'graphql',
   'apollo-server', 'stripe', 'openai', 'anthropic', '@anthropic-ai/sdk', '@babel/parser',
-  '@babel/traverse', '@babel/generator', 'esbuild', 'vite', 'webpack', 'rollup', 'tsx'
+  '@babel/traverse', '@babel/generator', 'esbuild', 'vite', 'webpack', 'rollup', 'tsx', 'trpc', '@trpc/server', '@trpc/client', 'tanstack-query', '@tanstack/react-query', 'zustand', 'redux', '@reduxjs/toolkit', 'swr', 'framer-motion', 'lucide-react', 'clsx', 'tailwind-merge', 'drizzle-kit', '@biomejs/biome', 'supertest', 'pino', 'winston', 'bullmq', '@supabase/supabase-js', 'firebase', '@aws-sdk/client-s3'
 ];
 
 const POPULAR_GO_MODULES = [
@@ -51,7 +51,7 @@ const POPULAR_PYPI_PACKAGES = [
   'requests', 'httpx', 'aiohttp', 'flask', 'fastapi', 'django', 'uvicorn', 'gunicorn',
   'pydantic', 'sqlalchemy', 'alembic', 'pytest', 'numpy', 'pandas', 'scipy', 'scikit-learn',
   'torch', 'transformers', 'openai', 'anthropic', 'langchain', 'boto3', 'pyyaml',
-  'python-dotenv', 'cryptography', 'pyjwt', 'celery', 'redis', 'psycopg2', 'pillow'
+  'python-dotenv', 'cryptography', 'pyjwt', 'celery', 'redis', 'psycopg2', 'pillow', 'polars', 'ruff', 'mypy', 'playwright', 'selenium', 'beautifulsoup4', 'scrapy', 'langgraph', 'litellm'
 ];
 
 function damerauLevenshtein(a, b) {

@@ -180,6 +180,21 @@ export function auditAntiSlopAst(code, filePath = 'unknown.ts') {
 
   try {
     traverse(ast, {
+      TSAsExpression(p) {
+        if (p.node.typeAnnotation?.type === 'TSAnyKeyword' && !isSuppressed(p.node, 'UNSAFE_ANY_CAST')) {
+          const line = p.node.loc?.start?.line || 1;
+          issues.push({
+            file: filePath,
+            line,
+            severity: 'MEDIUM',
+            category: 'AI_SLOP_AST',
+            type: 'UNSAFE_ANY_CAST',
+            message: 'Unsafe TypeScript "as any" type escape hatch hides type errors. Use a proper type guard or interface.',
+            snippet: getLineText(line)
+          });
+        }
+      },
+
       IfStatement(p) {
         const line = p.node.loc?.start?.line || 1;
         const evalRes = p.get('test').evaluate();

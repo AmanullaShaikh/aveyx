@@ -265,6 +265,70 @@ function isNestedDestructuredFromTaint(binding) {
 /**
  * Evaluates source -> sanitizer -> sink taint flows across intra-file and imported helpers.
  */
+
+export function isGuardedByDominatingBranch(callPath, targetNode) {
+  if (!callPath || !targetNode) return false;
+  const targetNames = new Set();
+  const collectIds = (n) => {
+    if (!n) return;
+    if (n.type === 'Identifier') targetNames.add(n.name);
+    else if (n.type === 'MemberExpression') { collectIds(n.object); collectIds(n.property); }
+    else if (n.type === 'BinaryExpression') { collectIds(n.left); collectIds(n.right); }
+    else if (n.type === 'TemplateLiteral') (n.expressions || []).forEach(collectIds);
+  };
+  collectIds(targetNode);
+  if (targetNames.size === 0) return false;
+
+  let cur = callPath;
+  while (cur && cur.parentPath) {
+    const parent = cur.parentPath;
+    if (parent.isIfStatement() && cur.key === 'consequent') {
+      let guarded = false;
+      const testPath = parent.get('test');
+      const mentionsTarget = (node) => {
+        if (!node) return false;
+        if (node.type === 'Identifier') return targetNames.has(node.name);
+        if (node.type === 'MemberExpression') return mentionsTarget(node.object) || mentionsTarget(node.property);
+        return false;
+      };
+      const checkTestNode = (tn) => {
+        if (!tn) return;
+        if (tn.type === 'LogicalExpression' && tn.operator === '&&') {
+          checkTestNode(tn.left);
+          checkTestNode(tn.right);
+          return;
+        }
+        // typeof x === "number" / "boolean"
+        if (
+          tn.type === 'BinaryExpression' &&
+          (tn.operator === '===' || tn.operator === '==') &&
+          tn.left?.type === 'UnaryExpression' &&
+          tn.left.operator === 'typeof' &&
+          mentionsTarget(tn.left.argument) &&
+          tn.right?.type === 'StringLiteral' &&
+          ['number', 'boolean'].includes(tn.right.value)
+        ) {
+          guarded = true;
+        }
+        // validator.isUUID(x) / isInt(x) / isNumeric(x) / Number.isInteger(x) / /^[0-9]+$/.test(x)
+        if (tn.type === 'CallExpression' && (tn.arguments || []).some(mentionsTarget)) {
+          const fn = tn.callee?.property?.name || tn.callee?.name || '';
+          if (['isUUID', 'isInt', 'isNumeric', 'isAlphanumeric', 'isInteger', 'isFinite'].includes(fn)) {
+            guarded = true;
+          }
+          if (fn === 'test' && tn.callee?.object?.type === 'RegExpLiteral' && /^\^[\w\\d0-9a-zA-Z_-]+\+\$/.test(tn.callee.object.pattern)) {
+            guarded = true;
+          }
+        }
+      };
+      checkTestNode(testPath.node);
+      if (guarded) return true;
+    }
+    cur = parent;
+  }
+  return false;
+}
+
 export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries = new Map()) {
   const issues = [];
   if (!ast) return issues;
@@ -400,6 +464,28 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
     }
 
     if (node.type === 'MemberExpression') {
+      const propKey = node.property?.name || node.property?.value;
+      if (propKey && node.object?.type === 'Identifier') {
+        let objBinding = scope?.getBinding(node.object.name);
+        // Follow 1-hop object alias: const x = a; -> check mutations on a.propKey
+        if (objBinding?.path?.node?.init?.type === 'Identifier') {
+          const aliased = objBinding.scope?.getBinding(objBinding.path.node.init.name);
+          if (aliased) objBinding = aliased;
+        }
+        if (objBinding?.referencePaths) {
+          for (const ref of objBinding.referencePaths) {
+            if (ref.parentPath?.isMemberExpression() && ref.parentPath.parentPath?.isAssignmentExpression()) {
+              const assign = ref.parentPath.parentPath;
+              if (assign.node.left === ref.parentPath.node) {
+                const assignedProp = ref.parentPath.node.property?.name || ref.parentPath.node.property?.value;
+                if (assignedProp === propKey && isExprTainted(assign.node.right, assign.scope, visited).tainted) {
+                  return { tainted: true, sqlConcat: false };
+                }
+              }
+            }
+          }
+        }
+      }
       return isExprTainted(node.object, scope, visited);
     }
 
@@ -504,7 +590,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
            ((propName === 'sendFile' || propName === 'download') && ['res', 'reply'].includes(objName)))
         ) {
           const arg0 = p.node.arguments[0];
-          if (arg0 && isExprTainted(arg0, p.scope).tainted) {
+          if (arg0 && !isGuardedByDominatingBranch(p, arg0) && isExprTainted(arg0, p.scope).tainted) {
             issues.push({
               file: filePath,
               line,
@@ -554,7 +640,7 @@ export function analyzeInterProceduralTaint(ast, filePath, importedFnSummaries =
           const arg0 = p.node.arguments[0];
           if (arg0) {
             const res = isExprTainted(arg0, p.scope);
-            if (res.tainted && (res.sqlConcat || arg0.type === 'SpreadElement' || (arg0.type === 'CallExpression' && arg0.callee?.property?.name === 'replace'))) {
+            if (!isGuardedByDominatingBranch(p, arg0) && res.tainted && (res.sqlConcat || arg0.type === 'SpreadElement' || (arg0.type === 'CallExpression' && arg0.callee?.property?.name === 'replace'))) {
               issues.push({
                 file: filePath,
                 line,
