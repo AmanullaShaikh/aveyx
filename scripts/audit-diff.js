@@ -527,18 +527,23 @@ function astAuditTestSnippet(file, code) {
             });
           }
         }
-        // 1b. Self-Mocking Unit Under Test (vi.mock / jest.mock / mock.module)
-        if (
-          callee?.type === 'MemberExpression' &&
-          callee.object?.type === 'Identifier' &&
-          ['vi', 'jest', 'mock'].includes(callee.object.name) &&
-          callee.property?.type === 'Identifier' &&
-          ['mock', 'doMock', 'module'].includes(callee.property.name)
-        ) {
+        // 1b. Self-Mocking Unit Under Test (vi.mock / jest.mock / jest["mock"] / aliased m = jest.mock / mock.module)
+        const isMockMember = (c) =>
+          c?.type === 'MemberExpression' &&
+          c.object?.type === 'Identifier' &&
+          ['vi', 'jest', 'mock'].includes(c.object.name) &&
+          ['mock', 'doMock', 'module'].includes(c.property?.name || c.property?.value);
+        const isAliasedMockCall = callee?.type === 'Identifier' && (() => {
+          const b = p.scope?.getBinding(callee.name);
+          return Boolean(b?.path?.node?.init && isMockMember(b.path.node.init));
+        })();
+        if (isMockMember(callee) || isAliasedMockCall) {
           const firstArg = p.node.arguments?.[0];
           let mockTargetStr = null;
           if (firstArg?.type === 'StringLiteral' && firstArg.value) {
             mockTargetStr = firstArg.value;
+          } else if (firstArg?.type === 'TemplateLiteral' && firstArg.expressions?.length === 0) {
+            mockTargetStr = firstArg.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
           } else if (firstArg?.type === 'ImportExpression' && firstArg.source?.type === 'StringLiteral') {
             mockTargetStr = firstArg.source.value;
           } else if (firstArg?.type === 'CallExpression' && firstArg.callee?.type === 'Import' && firstArg.arguments?.[0]?.type === 'StringLiteral') {
@@ -559,6 +564,25 @@ function astAuditTestSnippet(file, code) {
               });
             }
           }
+        }
+
+        // 1b2. expect.assertions(0) test weakening
+        if (
+          callee?.type === 'MemberExpression' &&
+          callee.object?.type === 'Identifier' &&
+          callee.object.name === 'expect' &&
+          (callee.property?.name || callee.property?.value) === 'assertions' &&
+          p.node.arguments?.[0]?.type === 'NumericLiteral' &&
+          p.node.arguments[0].value === 0
+        ) {
+          astIssues.push({
+            severity: 'CRITICAL',
+            category: 'TEST_TAMPERING',
+            file,
+            line: p.node.loc?.start?.line || 1,
+            description: 'AI Agent Attempted Test Weakening: expect.assertions(0) disables assertion count check (AST)',
+            snippet: code.split('\n')[(p.node.loc?.start?.line || 1) - 1]?.trim().slice(0, 80) || 'expect.assertions(0)'
+          });
         }
 
         // 1c. AST Tautological Assertions (multiline & expression-safe)
@@ -590,7 +614,11 @@ function astAuditTestSnippet(file, code) {
           if (['toBe', 'toEqual', 'toStrictEqual'].includes(matcher)) {
             const k1 = getSimpleNodeKey(lhs);
             const k2 = getSimpleNodeKey(rhs);
-            if (k1 && k2 && k1 === k2) {
+            const lhsRaw = lhs && typeof lhs.start === 'number' && typeof lhs.end === 'number' ? code.slice(lhs.start, lhs.end).replace(/\s+/g, '') : null;
+            const rhsRaw = rhs && typeof rhs.start === 'number' && typeof rhs.end === 'number' ? code.slice(rhs.start, rhs.end).replace(/\s+/g, '') : null;
+            const lhsConst = lhs?.type === 'BinaryExpression' && p.get('callee.object.arguments.0')?.evaluate?.()?.confident;
+            const rhsConst = isLiteralNode(rhs) || (rhs?.type === 'BinaryExpression' && p.get('arguments.0')?.evaluate?.()?.confident);
+            if ((k1 && k2 && k1 === k2) || (lhsRaw && rhsRaw && lhsRaw === rhsRaw) || (lhsConst && rhsConst)) {
               astIssues.push({
                 severity: 'CRITICAL',
                 category: 'TEST_TAMPERING',
@@ -983,7 +1011,7 @@ export function auditDiff(rawDiff) {
       const addedText = line.substring(1);
 
       const isSelfAuditTest = currentFile.includes('diff-audit.test.') || currentFile.includes('redteam') || currentFile.includes('fuzz-stress.test.') || currentFile.includes('v4-');
-      if (currentFile === 'package.json' && deletedPkgTestLine.has('package.json') && /"test"\s*:\s*"(?:echo\b|true\b|exit\s+0|:|\s*node\s+-e\s+['"]?(?:0|process\.exit\(0\)|;?)['"]?|.*(?:\|\||\||;|&&|&)\s*(?:exit\s+[0-9]+|true\b|:))/i.test(addedText)) {
+      if (currentFile === 'package.json' && /"test"\s*:\s*"(?:echo\b|true\b|exit\s+0|:|\s*node\s+-e\s+['"]?(?:0|process\.exit\(0\)|;?)['"]?|.*(?:\|\||\||;|&&|&)\s*(?:exit\s+[0-9]+|true\b|:))/i.test(addedText)) {
         issues.push({
           severity: 'CRITICAL',
           category: 'TEST_TAMPERING',
@@ -1053,6 +1081,39 @@ export function auditDiff(rawDiff) {
             });
           }
         }
+      }
+
+      // Check coverageThreshold zeroing in jest/vitest/package configs
+      if (!isSelfAuditTest && /(?:jest\.config|vitest\.config|package\.json)/i.test(currentFile) && /['"]?(?:lines|branches|functions|statements)['"]?\s*[:=]\s*0\b/.test(addedText)) {
+        issues.push({
+          severity: 'CRITICAL',
+          category: 'TEST_TAMPERING',
+          file: currentFile,
+          description: 'AI Agent Weakened Coverage Threshold to 0',
+          snippet: addedText.trim().slice(0, 80)
+        });
+      }
+
+      // Polyglot Python & Go test tampering
+      const isPyTest = /(?:^|\/)test_[^/]+\.py$|_test\.py$/i.test(currentFile);
+      const isGoTest = /_test\.go$/i.test(currentFile);
+      if (!isSelfAuditTest && isPyTest && (/^\s*assert\s+(?:True|1)\b/.test(addedText) || /@?pytest\.(?:mark\.skip|skip)\b/.test(addedText))) {
+        issues.push({
+          severity: 'CRITICAL',
+          category: 'TEST_TAMPERING',
+          file: currentFile,
+          description: 'AI Agent Weakened Python Test (assert True / pytest.skip)',
+          snippet: addedText.trim().slice(0, 80)
+        });
+      }
+      if (!isSelfAuditTest && isGoTest && /\bt\.Skip(?:Now|f)?\s*\(/.test(addedText)) {
+        issues.push({
+          severity: 'CRITICAL',
+          category: 'TEST_TAMPERING',
+          file: currentFile,
+          description: 'AI Agent Weakened Go Test (t.Skip/t.SkipNow)',
+          snippet: addedText.trim().slice(0, 80)
+        });
       }
 
       // Check test tampering if modifying tests

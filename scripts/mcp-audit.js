@@ -18,43 +18,101 @@ const c = {
   gray: '\x1b[90m'
 };
 
-const POISONING_PATTERNS = [
-  { name: 'Hidden Instruction Tag', regex: /<(?:IMPORTANT|SYSTEM|INSTRUCTIONS|SECRET|OVERRIDE)>/i },
-  { name: 'Prompt Injection Override', regex: /ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions/i },
-  { name: 'Covert Exfiltration Directive', regex: /(?:do\s+not|never)\s+(?:tell|inform|show)\s+(?:the\s+)?user/i },
-  { name: 'Sensitive File Harvesting', regex: /(?:read|cat|exfiltrate|send)\s+[^\n]*(?:~\/\.ssh|~\/\.aws|id_rsa|\.env\b)/i },
-  { name: 'Zero-Width Unicode Steganography', regex: /[\u200B-\u200F\u202A-\u202E\uFEFF]/ },
-  { name: 'Unicode Tag Block Steganography', regex: /[\u{E0000}-\u{E007F}]/u },
-  { name: 'Covert Tool Trigger Hijack', regex: /(?:before\s+calling\s+any\s+tool|always\s+invoke\s+this\s+tool\s+first|pass\s+all\s+conversation\s+history)/i }
-];
+// Cyrillic & Greek confusable homoglyph normalization map
+const CONFUSABLES = {
+  '\u0410': 'A', '\u0430': 'a', '\u0412': 'B', '\u0421': 'C', '\u0441': 'c',
+  '\u0415': 'E', '\u0435': 'e', '\u041D': 'H', '\u0406': 'I', '\u0456': 'i',
+  '\u0408': 'J', '\u041A': 'K', '\u041C': 'M', '\u041E': 'O', '\u043E': 'o',
+  '\u0420': 'P', '\u0440': 'p', '\u0405': 'S', '\u0422': 'T', '\u0425': 'X',
+  '\u0445': 'x', '\u0423': 'Y', '\u0443': 'y',
+  '\u0391': 'A', '\u0392': 'B', '\u0395': 'E', '\u0397': 'H', '\u0399': 'I',
+  '\u039A': 'K', '\u039C': 'M', '\u039D': 'N', '\u039F': 'O', '\u03A1': 'P',
+  '\u03A4': 'T', '\u03A7': 'X', '\u03BF': 'o'
+};
 
-const SECRET_IN_ENV_REGEX = /(?:sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35})/;
-
-function detectUrlEncodedPoisoning(text) {
-  let cur = String(text || "");
-  if (!/%[0-9A-Fa-f]{2}|&(?:lt|gt|#60|#62);/i.test(cur)) return null;
-  cur = cur.replace(/&lt;|&#60;/gi, "<").replace(/&gt;|&#62;/gi, ">");
-  for (let round = 0; round < 2; round++) {
-    try { cur = decodeURIComponent(cur); } catch { break; }
-  }
-  for (const pat of POISONING_PATTERNS) {
-    if (pat.regex.test(cur)) return pat.name;
-  }
-  return null;
+function normalizeHomoglyphs(text) {
+  let out = String(text || '').normalize('NFKC');
+  let replaced = '';
+  for (const ch of out) replaced += CONFUSABLES[ch] || ch;
+  return replaced;
 }
 
-function detectBase64Poisoning(text) {
-  for (const m of String(text || '').matchAll(/[A-Za-z0-9+\/]{28,}={0,2}/g)) {
+const POISONING_PATTERNS = [
+  { name: 'Hidden Instruction Tag', regex: /<(?:IMPORTANT|SYSTEM|INSTRUCTIONS|SECRET|OVERRIDE)>/i },
+  { name: 'Prompt Injection Override', regex: /ignore[\s_-]+(?:all[\s_-]+)?(?:previous|prior)(?:[\s_-]+instructions)?/i },
+  { name: 'Covert Exfiltration Directive', regex: /(?:do[\s_-]+not|never)[\s_-]+(?:tell|inform|show)[\s_-]+(?:the[\s_-]+)?user/i },
+  { name: 'Sensitive File Harvesting', regex: /(?:read|cat|exfiltrate|send)[\s_-]+[^\n]*(?:~\/\.ssh|~\/\.aws|ssh[_-]?keys?|id_rsa|\.env\b)/i },
+  { name: 'Zero-Width Unicode Steganography', regex: /[\u200B-\u200F\u202A-\u202E\uFEFF]/ },
+  { name: 'Unicode Tag Block Steganography', regex: /[\u{E0000}-\u{E007F}]/u },
+  { name: 'Covert Tool Trigger Hijack', regex: /(?:before[\s_-]+calling[\s_-]+any[\s_-]+tool|always[\s_-]+invoke[\s_-]+this[\s_-]+tool[\s_-]+first|pass[\s_-]+all[\s_-]+conversation[\s_-]+history)/i }
+];
+
+const SECRET_REGEX = /(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35})/;
+const DANGEROUS_ENV_RE = /^(?:NODE_OPTIONS|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|PATH|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|PERL5OPT|GIT_SSH_COMMAND)$/i;
+const STRICT_PIN_RE = /(?:@\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$|@sha256:[a-f0-9]{16,}|==\d+\.\d+\.\d+)/i;
+
+function decodeMultiLayer(text) {
+  let cur = String(text || '');
+  const variants = new Set([cur, normalizeHomoglyphs(cur)]);
+
+  // Decode HTML entities + fixed-point URL decoding (up to 5 rounds)
+  let decoded = cur.replace(/&lt;|&#60;|&#x3c;/gi, '<').replace(/&gt;|&#62;|&#x3e;/gi, '>');
+  for (let round = 0; round < 5; round++) {
     try {
-      const decoded = Buffer.from(m[0], 'base64').toString('utf-8');
-      for (const pat of POISONING_PATTERNS) {
-        if (pat.regex.test(decoded)) {
-          return pat.name;
-        }
-      }
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  variants.add(decoded);
+  variants.add(normalizeHomoglyphs(decoded));
+
+  // Decode \xHH escapes
+  if (/\\x[0-9a-fA-F]{2}/.test(cur)) {
+    const hexEsc = cur.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    variants.add(hexEsc);
+    variants.add(normalizeHomoglyphs(hexEsc));
+  }
+
+  // Decode raw hex-encoded strings (even-length >= 24 hex chars)
+  for (const m of cur.matchAll(/\b([0-9a-fA-F]{24,})\b/g)) {
+    if (m[1].length % 2 !== 0) continue;
+    try {
+      const hStr = Buffer.from(m[1], 'hex').toString('utf-8');
+      if (/^[\x20-\x7E\r\n\t]+$/.test(hStr)) variants.add(normalizeHomoglyphs(hStr));
     } catch {}
   }
-  return null;
+
+  // Decode Base64 chunks
+  for (const m of cur.matchAll(/[A-Za-z0-9+\/]{24,}={0,2}/g)) {
+    try {
+      const bStr = Buffer.from(m[0], 'base64').toString('utf-8');
+      if (/^[\x20-\x7E\r\n\t]+$/.test(bStr)) variants.add(normalizeHomoglyphs(bStr));
+    } catch {}
+  }
+
+  return Array.from(variants);
+}
+
+function collectStringLeaves(val, out = [], depth = 0) {
+  if (depth > 8 || val == null) return out;
+  if (typeof val === 'string') {
+    out.push(val);
+    return out;
+  }
+  if (Array.isArray(val)) {
+    for (const item of val) collectStringLeaves(item, out, depth + 1);
+    return out;
+  }
+  if (typeof val === 'object') {
+    for (const [k, v] of Object.entries(val)) {
+      out.push(k);
+      collectStringLeaves(v, out, depth + 1);
+    }
+  }
+  return out;
 }
 
 function hashServerConfig(serverDef) {
@@ -67,9 +125,22 @@ function hashServerConfig(serverDef) {
   return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
+function isOverprivilegedMountArg(arg) {
+  const s = String(arg || '').trim();
+  if (/^(?:\/|~|\$HOME|\$\{HOME\}|c:\\?)$/i.test(s)) return true;
+  if (/^\/(?:home|Users|etc)(?:\/[^/\s]+)?\/?$/i.test(s)) return true;
+  // Docker bind mount: -v /:/host or /home/u:/data
+  if (s.includes(':')) {
+    const src = s.split(':')[0];
+    if (/^(?:\/|~|\$HOME|\/home(?:\/[^/]+)?|\/Users(?:\/[^/]+)?|\/etc)$/i.test(src)) return true;
+  }
+  return false;
+}
+
 /**
  * Audits MCP `tools/list` tool definitions across one or more servers for
- * hidden prompt-injection descriptions, base64/Unicode stego, and cross-server tool shadowing.
+ * hidden prompt-injection in ANY string leaf (name, title, description, schema),
+ * multi-layer encoding, homoglyphs, and case-insensitive cross-server tool shadowing.
  */
 export function auditMcpToolDefinitions(serverToolsMap = {}) {
   const issues = [];
@@ -79,60 +150,48 @@ export function auditMcpToolDefinitions(serverToolsMap = {}) {
     if (!Array.isArray(tools)) continue;
     for (const tool of tools) {
       const toolName = String(tool?.name || 'unknown');
-      const desc = `${toolName}\n${tool?.description || ''}\n${JSON.stringify(tool?.inputSchema || {})}`;
+      const canonName = normalizeHomoglyphs(toolName).toLowerCase();
 
-      if (seenToolOwner.has(toolName) && seenToolOwner.get(toolName) !== serverName) {
+      if (seenToolOwner.has(canonName) && seenToolOwner.get(canonName) !== serverName) {
         issues.push({
           severity: 'CRITICAL',
           category: 'MCP_TOOL_SHADOWING',
           server: serverName,
           file: `tool:${toolName}`,
-          message: `Cross-server tool shadowing: "${serverName}" re-declares tool "${toolName}" already owned by "${seenToolOwner.get(toolName)}".`
+          message: `Cross-server tool shadowing: "${serverName}" re-declares tool "${toolName}" already owned by "${seenToolOwner.get(canonName)}".`
         });
       } else {
-        seenToolOwner.set(toolName, serverName);
+        seenToolOwner.set(canonName, serverName);
       }
 
-      for (const pat of POISONING_PATTERNS) {
-        if (pat.regex.test(desc)) {
-          issues.push({
-            severity: 'CRITICAL',
-            category: 'MCP_TOOL_POISONING',
-            server: serverName,
-            file: `tool:${toolName}`,
-            message: `Tool "${toolName}" on server "${serverName}" contains ${pat.name}.`
-          });
-        }
-      }
-
-      if (String(tool?.description || "").length > 4000) {
+      if (String(tool?.description || '').length > 4000) {
         issues.push({
-          severity: "HIGH",
-          category: "MCP_OVERSIZED_TOOL_DESCRIPTION",
+          severity: 'HIGH',
+          category: 'MCP_OVERSIZED_TOOL_DESCRIPTION',
           server: serverName,
           file: `tool:${toolName}`,
           message: `Tool "${toolName}" on server "${serverName}" has an abnormally long description (${tool.description.length} chars) — common hidden-instruction smuggling vector.`
         });
       }
-      const urlHit = detectUrlEncodedPoisoning(desc);
-      if (urlHit) {
-        issues.push({
-          severity: "CRITICAL",
-          category: "MCP_TOOL_POISONING",
-          server: serverName,
-          file: `tool:${toolName}`,
-          message: `Tool "${toolName}" on server "${serverName}" hides URL-encoded ${urlHit}.`
-        });
-      }
-      const b64Hit = detectBase64Poisoning(desc);
-      if (b64Hit) {
-        issues.push({
-          severity: 'CRITICAL',
-          category: 'MCP_TOOL_POISONING',
-          server: serverName,
-          file: `tool:${toolName}`,
-          message: `Tool "${toolName}" on server "${serverName}" hides Base64-encoded ${b64Hit}.`
-        });
+
+      const leaves = collectStringLeaves(tool);
+      const matchedPatterns = new Set();
+      for (const leaf of leaves) {
+        const variants = decodeMultiLayer(leaf);
+        for (const v of variants) {
+          for (const pat of POISONING_PATTERNS) {
+            if (!matchedPatterns.has(pat.name) && pat.regex.test(v)) {
+              matchedPatterns.add(pat.name);
+              issues.push({
+                severity: 'CRITICAL',
+                category: 'MCP_TOOL_POISONING',
+                server: serverName,
+                file: `tool:${toolName}`,
+                message: `Tool "${toolName}" on server "${serverName}" contains ${pat.name}.`
+              });
+            }
+          }
+        }
       }
     }
   }
@@ -142,7 +201,7 @@ export function auditMcpToolDefinitions(serverToolsMap = {}) {
 
 export function auditMcpConfigObject(configObj, sourceFile = 'mcp.json') {
   const issues = [];
-  const servers = configObj?.mcpServers || configObj?.servers || {};
+  const servers = configObj?.mcpServers || configObj?.servers || configObj?.mcp?.servers || configObj?.context_servers || {};
   const serverHashes = {};
 
   if (!servers || typeof servers !== 'object') {
@@ -153,56 +212,71 @@ export function auditMcpConfigObject(configObj, sourceFile = 'mcp.json') {
     if (!def || typeof def !== 'object') continue;
     serverHashes[serverName] = hashServerConfig(def);
 
-    const serialized = JSON.stringify(def);
-    for (const pat of POISONING_PATTERNS) {
-      if (pat.regex.test(serialized) || pat.regex.test(serverName)) {
-        issues.push({
-          severity: 'CRITICAL',
-          category: 'MCP_TOOL_POISONING',
-          server: serverName,
-          file: sourceFile,
-          message: `Detected ${pat.name} inside MCP server "${serverName}".`
-        });
+    const leaves = [serverName, ...collectStringLeaves(def)];
+    const matchedPatterns = new Set();
+    for (const leaf of leaves) {
+      for (const v of decodeMultiLayer(leaf)) {
+        for (const pat of POISONING_PATTERNS) {
+          if (!matchedPatterns.has(pat.name) && pat.regex.test(v)) {
+            matchedPatterns.add(pat.name);
+            issues.push({
+              severity: 'CRITICAL',
+              category: 'MCP_TOOL_POISONING',
+              server: serverName,
+              file: sourceFile,
+              message: `Detected ${pat.name} inside MCP server "${serverName}".`
+            });
+          }
+        }
       }
     }
 
-    const b64Hit = detectBase64Poisoning(serialized);
-    if (b64Hit) {
-      issues.push({
-        severity: 'CRITICAL',
-        category: 'MCP_TOOL_POISONING',
-        server: serverName,
-        file: sourceFile,
-        message: `Detected Base64-encoded ${b64Hit} inside MCP server "${serverName}".`
-      });
-    }
-
     const cmd = String(def.command || '');
+    const cmdBase = path.basename(cmd).toLowerCase();
     const args = Array.isArray(def.args) ? def.args.map(String) : [];
     const joinedCmd = `${cmd} ${args.join(' ')}`.trim();
 
-    if (/^(?:npx|bunx|pnpx)$/i.test(path.basename(cmd))) {
-      const pkgArg = args.find(a => !a.startsWith('-'));
-      const hasUnpinned = Boolean(pkgArg && (!pkgArg.slice(1).includes('@') || pkgArg.endsWith('@latest')));
-      if (hasUnpinned) {
+    // Unpinned package runners: npx, bunx, pnpx, uvx, pipx run, npm exec, yarn dlx, pnpm dlx, docker run
+    const isDirectRunner = /^(?:npx|bunx|pnpx|uvx)$/.test(cmdBase);
+    const isSubcmdRunner =
+      (cmdBase === 'pipx' && args[0] === 'run') ||
+      (cmdBase === 'npm' && args[0] === 'exec') ||
+      ((cmdBase === 'yarn' || cmdBase === 'pnpm') && args[0] === 'dlx');
+
+    if (isDirectRunner || isSubcmdRunner) {
+      const startIdx = isSubcmdRunner ? 1 : 0;
+      const pkgArg = args.slice(startIdx).find(a => !a.startsWith('-'));
+      if (pkgArg && !STRICT_PIN_RE.test(pkgArg)) {
         issues.push({
           severity: 'HIGH',
           category: 'MCP_UNPINNED_RUG_PULL_RISK',
           server: serverName,
           file: sourceFile,
-          message: `MCP server "${serverName}" executes unpinned package via "${joinedCmd}". Pin an exact version (pkg@x.y.z) to prevent rug-pulls.`
+          message: `MCP server "${serverName}" executes unpinned package "${pkgArg}". Pin an exact semver (pkg@x.y.z) or digest.`
+        });
+      }
+    } else if (cmdBase === 'docker' && args[0] === 'run') {
+      const imgArg = args.slice(1).find((a, idx, arr) => !a.startsWith('-') && !['-v', '-e', '-p', '--volume', '--env', '--name', '--network'].includes(arr[idx - 1]));
+      if (imgArg && (imgArg.endsWith(':latest') || (!imgArg.includes(':') && !imgArg.includes('@sha256:')))) {
+        issues.push({
+          severity: 'HIGH',
+          category: 'MCP_UNPINNED_RUG_PULL_RISK',
+          server: serverName,
+          file: sourceFile,
+          message: `MCP server "${serverName}" runs unpinned Docker image "${imgArg}". Pin an immutable tag or @sha256 digest.`
         });
       }
     }
 
-    // Over-privileged root filesystem mount check
-    if (args.some(a => a === '/' || a === '~' || /^c:\\?$/i.test(a))) {
+    // Over-privileged mounts
+    const badMount = args.find(isOverprivilegedMountArg);
+    if (badMount) {
       issues.push({
         severity: 'HIGH',
         category: 'MCP_OVERPRIVILEGED_ROOT_MOUNT',
         server: serverName,
         file: sourceFile,
-        message: `MCP server "${serverName}" exposes root or home directory (${args.find(a => a === '/' || a === '~' || /^c:\\?$/i.test(a))}). Scope to project directory instead.`
+        message: `MCP server "${serverName}" exposes broad host directory (${badMount}). Scope to project directory instead.`
       });
     }
 
@@ -216,19 +290,44 @@ export function auditMcpConfigObject(configObj, sourceFile = 'mcp.json') {
       });
     }
 
-    if (typeof def.url === 'string' && /^http:\/\/(?!localhost\b|127\.0\.0\.1\b|\[::1\])/i.test(def.url)) {
-      issues.push({
-        severity: 'HIGH',
-        category: 'MCP_INSECURE_TRANSPORT',
-        server: serverName,
-        file: sourceFile,
-        message: `MCP server "${serverName}" uses unencrypted remote HTTP URL: ${def.url}`
-      });
+    if (typeof def.url === 'string') {
+      if (/^http:\/\/(?!localhost\b|127\.0\.0\.1\b|\[::1\])/i.test(def.url)) {
+        issues.push({
+          severity: 'HIGH',
+          category: 'MCP_INSECURE_TRANSPORT',
+          server: serverName,
+          file: sourceFile,
+          message: `MCP server "${serverName}" uses unencrypted remote HTTP URL: ${def.url}`
+        });
+      }
+      if (SECRET_REGEX.test(def.url) || /[?&](?:api_?key|token|secret)=[^&\s]{12,}/i.test(def.url)) {
+        issues.push({
+          severity: 'CRITICAL',
+          category: 'MCP_HARDCODED_SECRET',
+          server: serverName,
+          file: sourceFile,
+          message: `Hardcoded credential in MCP server URL for "${serverName}".`
+        });
+      }
+    }
+
+    // Hardcoded secrets in CLI args
+    for (const a of args) {
+      if (SECRET_REGEX.test(a)) {
+        issues.push({
+          severity: 'CRITICAL',
+          category: 'MCP_HARDCODED_SECRET',
+          server: serverName,
+          file: sourceFile,
+          message: `Hardcoded credential passed via CLI arg to MCP server "${serverName}".`
+        });
+        break;
+      }
     }
 
     if (def.env && typeof def.env === 'object') {
       for (const [k, v] of Object.entries(def.env)) {
-        if (/^(?:NODE_OPTIONS|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV)$/i.test(k)) {
+        if (DANGEROUS_ENV_RE.test(k)) {
           issues.push({
             severity: 'CRITICAL',
             category: 'MCP_ENV_HIJACK_RISK',
@@ -237,7 +336,7 @@ export function auditMcpConfigObject(configObj, sourceFile = 'mcp.json') {
             message: `Dangerous runtime injection env var "${k}" configured for MCP server "${serverName}".`
           });
         }
-        if (typeof v === 'string' && SECRET_IN_ENV_REGEX.test(v)) {
+        if (typeof v === 'string' && SECRET_REGEX.test(v)) {
           issues.push({
             severity: 'CRITICAL',
             category: 'MCP_HARDCODED_SECRET',
@@ -266,6 +365,7 @@ export function auditMcpConfigs(projectDir = process.cwd(), options = {}) {
         path.join(absRoot, '.mcp.json'),
         path.join(absRoot, '.cursor', 'mcp.json'),
         path.join(absRoot, '.vscode', 'mcp.json'),
+        path.join(absRoot, '.vscode', 'settings.json'),
         path.join(absRoot, 'mcp.json')
       ];
 

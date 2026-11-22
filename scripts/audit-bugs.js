@@ -5,7 +5,7 @@ import path from 'node:path';
 import { parse } from '@babel/parser';
 import { buildSarifReport } from './audit-diff.js';
 import { resolveImportPath } from './dependency-graph.js';
-import { analyzeInterProceduralTaint, extractFileExportSummaries } from './taint-engine.js';
+import { analyzeInterProceduralTaint, extractFileExportSummaries, isSanitizerCall } from './taint-engine.js';
 import _traverse from '@babel/traverse';
 
 const traverse = _traverse.default || _traverse;
@@ -459,8 +459,19 @@ export function auditCodeBugs(code, filePath = 'unknown.ts', options = {}) {
           const isVulnerableSqlExpression = (node, scope, visited = new Set()) => {
             if (!node) return false;
 
-            // 1. Direct binary expression string concatenation (+)
+            const isSafeOperand = (op, sc) => {
+              if (!op) return true;
+              if (op.type === 'StringLiteral' || op.type === 'NumericLiteral' || op.type === 'BooleanLiteral') return true;
+              if (isSanitizerCall(op)) return true;
+              if (op.type === 'Identifier') {
+                const b = sc?.getBinding(op.name);
+                if (b?.path?.node?.init && isSanitizerCall(b.path.node.init) && (!b.constantViolations || b.constantViolations.length === 0)) return true;
+              }
+              return false;
+            };
+            // 1. Direct binary expression string concatenation (+) — respect Number()/parseInt() sanitizers
             if (node.type === 'BinaryExpression' && node.operator === '+') {
+              if (isSafeOperand(node.left, scope) && isSafeOperand(node.right, scope)) return false;
               return true;
             }
 

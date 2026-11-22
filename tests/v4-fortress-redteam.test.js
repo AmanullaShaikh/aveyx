@@ -114,7 +114,7 @@ describe('Aveyx v4 Fortress Red-Team Suite (Zero-Bypass Verification)', () => {
       ]
     });
     assert.strictEqual(res.passed, false);
-    assert.ok(res.issues.some(i => i.category === 'MCP_TOOL_POISONING' && /URL-encoded/i.test(i.message)));
+    assert.ok(res.issues.some(i => i.file === 'tool:t1' && i.category === 'MCP_TOOL_POISONING'));
     assert.ok(res.issues.some(i => i.category === 'MCP_TOOL_POISONING' && /Unicode Tag Block/i.test(i.message)));
     assert.ok(res.issues.some(i => i.category === 'MCP_OVERSIZED_TOOL_DESCRIPTION'));
   });

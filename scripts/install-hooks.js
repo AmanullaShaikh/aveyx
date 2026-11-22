@@ -18,6 +18,56 @@ function resolveGitCommonDir(projectDir) {
   }
 }
 
+function stripJsonCommentsAndTrailingCommas(raw) {
+  let out = '';
+  let inStr = false;
+  let escaped = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inLineComment) {
+      if (ch === '\n') {
+        inLineComment = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inStr) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out.replace(/,\s*([}\]])/g, '$1');
+}
+
 export function installGitHooks(projectDir = process.cwd(), options = {}) {
   const gitCommonDir = resolveGitCommonDir(projectDir);
   if (!gitCommonDir) {
@@ -81,28 +131,21 @@ fi
     if (existingContent.includes('AVEYX PRE-COMMIT') || existingContent.includes('Aveyx Hook')) {
       console.log(`\x1b[33m• Pre-commit hook already contains Aveyx protection.\x1b[0m`);
     } else {
+      const backupPath = `${preCommitHookPath}.aveyx-backup.${Date.now()}`;
+      fs.copyFileSync(preCommitHookPath, backupPath);
+      console.log(`\x1b[36m• Preserved existing pre-commit hook (backed up to: ${path.basename(backupPath)})\x1b[0m`);
 
-    // Safety backup of existing hook
-    const backupPath = `${preCommitHookPath}.aveyx-backup.${Date.now()}`;
-    fs.copyFileSync(preCommitHookPath, backupPath);
-    console.log(`\x1b[36m• Preserved existing pre-commit hook (backed up to: ${path.basename(backupPath)})\x1b[0m`);
-
-    // Chain/append without destroying user's existing hook
       const chained = existingContent.trim() + '\n' + aveyxSnippet;
       fs.writeFileSync(preCommitHookPath, chained.replace(/\r\n/g, '\n'), { mode: 0o755 });
     }
   } else {
-    // Create new executable hook
     const fullHook = `#!/bin/sh\n# Aveyx Automated Zero-Slop & Secret Leak Pre-Commit Hook\n${aveyxSnippet}\nexit 0\n`;
     fs.writeFileSync(preCommitHookPath, fullHook.replace(/\r\n/g, '\n'), { mode: 0o755 });
   }
 
   try {
     fs.chmodSync(preCommitHookPath, 0o755);
-  } catch {
-    // Windows chmod is a no-op, safe
-  }
-
+  } catch {}
 
   if (options.prePush) {
     const prePushPath = path.join(hooksDir, 'pre-push');
@@ -112,11 +155,11 @@ echo "⚡ [Aveyx Hook] Running pre-push verification..."
 
 if command -v node >/dev/null 2>&1; then
   if [ -f "./scripts/scan-secrets.js" ]; then
-    node "./scripts/scan-secrets.js" || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
+    node "./scripts/scan-secrets.js" --unpushed || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
   elif command -v aveyx >/dev/null 2>&1; then
-    aveyx scan-secrets || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
+    aveyx scan-secrets --unpushed || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
   elif command -v npx >/dev/null 2>&1; then
-    npx aveyx scan-secrets || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
+    npx aveyx scan-secrets --unpushed || { echo "❌ PUSH BLOCKED: Secret Leak Sentinel failed!"; exit 1; }
   fi
 
   if [ -f "./scripts/audit-bugs.js" ]; then
@@ -154,7 +197,11 @@ fi
   return true;
 }
 
-
+/**
+ * Safely installs Aveyx PreToolUse & Stop runtime hooks into .claude/settings.json.
+ * Always backs up existing settings BEFORE parsing, supports JSONC comments/trailing commas,
+ * and aborts without overwriting if the file cannot be parsed (preserving user permissions/deny rules).
+ */
 export function installClaudeHooks(projectDir = process.cwd()) {
   const claudeDir = path.join(projectDir, '.claude');
   const settingsPath = path.join(claudeDir, 'settings.json');
@@ -162,16 +209,24 @@ export function installClaudeHooks(projectDir = process.cwd()) {
 
   let settings = {};
   if (fs.existsSync(settingsPath)) {
+    const raw = fs.readFileSync(settingsPath, 'utf-8');
+    const backupPath = `${settingsPath}.aveyx-backup.${Date.now()}`;
+    fs.copyFileSync(settingsPath, backupPath);
+
     try {
-      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-      const backupPath = `${settingsPath}.aveyx-backup.${Date.now()}`;
-      fs.copyFileSync(settingsPath, backupPath);
-    } catch {
-      settings = {};
+      const cleaned = stripJsonCommentsAndTrailingCommas(raw);
+      const parsed = cleaned.trim() ? JSON.parse(cleaned) : {};
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.error(`\x1b[31mError: ${settingsPath} is not a JSON object. Aborting without overwriting (backup: ${path.basename(backupPath)}).\x1b[0m`);
+        return false;
+      }
+      settings = parsed;
+    } catch (err) {
+      console.error(`\x1b[31mError: Failed to parse ${settingsPath} (${err.message}). Aborting without overwriting (backup: ${path.basename(backupPath)}).\x1b[0m`);
+      return false;
     }
   }
 
-  if (!settings || typeof settings !== 'object') settings = {};
   if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
 
   const preToolCmd = fs.existsSync(path.join(projectDir, 'scripts', 'agent-hook-guard.js'))
@@ -181,12 +236,16 @@ export function installClaudeHooks(projectDir = process.cwd()) {
     ? 'node ./scripts/audit-diff.js --strict'
     : 'npx aveyx review --strict';
 
+  const FULL_MATCHER = 'Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob';
   const preToolList = Array.isArray(settings.hooks.PreToolUse) ? settings.hooks.PreToolUse : [];
-  if (!JSON.stringify(preToolList).includes('agent-hook-guard') && !JSON.stringify(preToolList).includes('aveyx hook-guard')) {
+  const existingGuardEntry = preToolList.find(e => JSON.stringify(e).includes('agent-hook-guard') || JSON.stringify(e).includes('aveyx hook-guard'));
+  if (!existingGuardEntry) {
     preToolList.push({
-      matcher: 'Bash|Read|Edit|Write',
+      matcher: FULL_MATCHER,
       hooks: [{ type: 'command', command: preToolCmd }]
     });
+  } else {
+    existingGuardEntry.matcher = FULL_MATCHER;
   }
   settings.hooks.PreToolUse = preToolList;
 
@@ -205,10 +264,15 @@ export function installClaudeHooks(projectDir = process.cwd()) {
 
 if (process.argv[1] && process.argv[1].endsWith('install-hooks.js')) {
   const prePush = process.argv.includes('--pre-push') || process.argv.includes('--all');
-  const claude = process.argv.includes('--claude') || process.argv.includes('--all');
+  const explicitClaude = process.argv.includes('--claude') || process.argv.includes('--all');
+  const noClaude = process.argv.includes('--no-claude');
+  const autoClaude = !noClaude && fs.existsSync(path.join(process.cwd(), '.claude'));
+
   const installed = installGitHooks(process.cwd(), { prePush });
-  if (installed && claude) installClaudeHooks(process.cwd());
-  if (!installed) {
-    process.exit(1);
+  if (!installed) process.exit(1);
+
+  if (explicitClaude || autoClaude) {
+    const claudeOk = installClaudeHooks(process.cwd());
+    if (!claudeOk) process.exit(1);
   }
 }

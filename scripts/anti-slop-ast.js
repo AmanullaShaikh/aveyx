@@ -19,8 +19,12 @@ const c = {
 };
 
 const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.agents', '.worktrees', 'coverage']);
+const EXEMPT_STUB_NAMES = /^(?:noop|_noop|identity)$/i;
 
-function isNullishOrBoolLiteral(node) {
+// Strict suppression format: `aveyx-ignore <RULE_ID>: <reason >= 15 chars>`
+const STRICT_IGNORE_RE = /\baveyx-ignore\s+([A-Z0-9_]+)\s*:\s*(.{15,})/i;
+
+function isNullishOrEmptyLiteral(node) {
   if (!node) return true;
   if (node.type === 'NullLiteral' || node.type === 'BooleanLiteral') return true;
   if (node.type === 'Identifier' && node.name === 'undefined') return true;
@@ -28,6 +32,38 @@ function isNullishOrBoolLiteral(node) {
   if (node.type === 'ObjectExpression' && node.properties.length === 0) return true;
   if (node.type === 'ArrayExpression' && node.elements.length === 0) return true;
   return false;
+}
+
+function isNoOpStatement(stmt) {
+  if (!stmt) return true;
+  if (stmt.type === 'EmptyStatement') return true;
+  if (stmt.type === 'ExpressionStatement') {
+    const ex = stmt.expression;
+    if (ex.type === 'Identifier') return true; // bare `e;`
+    if (ex.type === 'UnaryExpression' && ex.operator === 'void') return true; // `void e;`
+    // Log-only catch body: console.log(e) / console.warn(e) / console.error(e) with no recovery
+    if (
+      ex.type === 'CallExpression' &&
+      ex.callee?.type === 'MemberExpression' &&
+      ex.callee.object?.name === 'console' &&
+      ['log', 'warn', 'error', 'debug', 'info'].includes(ex.callee.property?.name)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSilentHandlerFn(fnNode) {
+  if (!fnNode || (fnNode.type !== 'ArrowFunctionExpression' && fnNode.type !== 'FunctionExpression')) return false;
+  if (fnNode.body?.type === 'BlockStatement') {
+    const stmts = fnNode.body.body;
+    if (stmts.length === 0) return true;
+    if (stmts.every(isNoOpStatement)) return true;
+    if (stmts.length === 1 && stmts[0].type === 'ReturnStatement' && isNullishOrEmptyLiteral(stmts[0].argument)) return true;
+    return false;
+  }
+  return isNullishOrEmptyLiteral(fnNode.body);
 }
 
 function getParamNames(params = []) {
@@ -41,11 +77,13 @@ function getParamNames(params = []) {
 
 /**
  * AST-based Anti-Slop Ruleset:
- * 1. Empty catch {} blocks (silent error swallowing)
- * 2. Silent catch { return null/undefined/false; } error masking
- * 3. Silent Promise .catch(() => {}) / .catch(() => null)
- * 4. Redundant 1:1 pass-through wrapper functions
- * 5. Empty exported stub functions / route handlers
+ * - EMPTY_CATCH_BLOCK (empty, void e, bare e, log-only catch)
+ * - SILENT_ERROR_MASKING (catch returning null/undefined/bool/{}/[])
+ * - FINALLY_RETURN_SWALLOW (return inside finally swallowing thrown errors)
+ * - SILENT_PROMISE_SWALLOW (.catch(() => {}) and .then(ok, () => {}))
+ * - EMPTY_STUB_FUNCTION (exported functions, exported arrows, empty class methods, return-only stubs)
+ * - REDUNDANT_WRAPPER (sync and async 1:1 pass-through wrappers)
+ * - DEAD_CODE_BRANCH (constant-falsy if/while branches via AST evaluation)
  */
 export function auditAntiSlopAst(code, filePath = 'unknown.ts') {
   const issues = [];
@@ -59,85 +97,199 @@ export function auditAntiSlopAst(code, filePath = 'unknown.ts') {
   }
 
   const lines = code.split('\n');
+  const allComments = Array.isArray(ast.comments) ? ast.comments : [];
   const getLineText = (line) => (lines[(line || 1) - 1] || '').trim().slice(0, 80);
-  const hasIgnoreComment = (node) => {
-    const start = Math.max(0, (node.loc?.start?.line || 1) - 1);
-    const end = Math.min(lines.length, (node.loc?.end?.line || start + 1));
-    const slice = lines.slice(start, end).join('\n');
-    return /aveyx-ignore|intentional|ignore error|safe fallback|best[- ]effort/i.test(slice);
+
+  // Check ONLY real AST comment nodes on the same line, inside the node, or on the immediately preceding line.
+  const isSuppressed = (node, ruleType) => {
+    const startLine = node.loc?.start?.line || 1;
+    const endLine = node.loc?.end?.line || startLine;
+    for (const cm of allComments) {
+      const cStart = cm.loc?.start?.line || 0;
+      const cEnd = cm.loc?.end?.line || 0;
+      const adjacent = (cEnd === startLine - 1) || (cStart >= startLine && cEnd <= endLine);
+      if (!adjacent) continue;
+      const m = STRICT_IGNORE_RE.exec(cm.value || '');
+      if (m && (m[1].toUpperCase() === ruleType || m[1].toUpperCase() === 'ALL')) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const checkWrapperOrStub = (name, fnNode, isExported, line) => {
+    if (name && EXEMPT_STUB_NAMES.test(name)) return;
+    if (!fnNode?.body) return;
+
+    if (fnNode.body.type !== 'BlockStatement') {
+      if (isExported && isNullishOrEmptyLiteral(fnNode.body) && !isSuppressed(fnNode, 'EMPTY_STUB_FUNCTION')) {
+        issues.push({
+          file: filePath,
+          line,
+          severity: 'HIGH',
+          category: 'AI_SLOP_AST',
+          type: 'EMPTY_STUB_FUNCTION',
+          message: `Exported function "${name || 'default'}" returns only a constant nullish/empty stub.`,
+          snippet: getLineText(line)
+        });
+      }
+      return;
+    }
+
+    const body = fnNode.body.body || [];
+    const isEmptyOrBareReturn = body.length === 0 || (body.length === 1 && body[0].type === 'ReturnStatement' && !body[0].argument);
+    if (isExported && isEmptyOrBareReturn && !isSuppressed(fnNode, 'EMPTY_STUB_FUNCTION')) {
+      issues.push({
+        file: filePath,
+        line,
+        severity: 'HIGH',
+        category: 'AI_SLOP_AST',
+        type: 'EMPTY_STUB_FUNCTION',
+        message: `Exported function "${name || 'default'}" has an empty/no-op body (unimplemented stub).`,
+        snippet: getLineText(line)
+      });
+      return;
+    }
+
+    // Redundant 1:1 wrapper (sync or async): function foo(a) { return bar(a); } / async function foo(a) { return await bar(a); }
+    if (!isExported && body.length === 1 && body[0].type === 'ReturnStatement' && body[0].argument) {
+      let retExpr = body[0].argument;
+      if (retExpr.type === 'AwaitExpression') retExpr = retExpr.argument;
+      if (retExpr?.type === 'CallExpression' && retExpr.callee?.type === 'Identifier' && retExpr.callee.name !== name) {
+        const paramNames = getParamNames(fnNode.params);
+        if (
+          paramNames &&
+          paramNames.length > 0 &&
+          retExpr.arguments.length === paramNames.length &&
+          retExpr.arguments.every((arg, i) => arg.type === 'Identifier' && arg.name === paramNames[i]) &&
+          !isSuppressed(fnNode, 'REDUNDANT_WRAPPER')
+        ) {
+          issues.push({
+            file: filePath,
+            line,
+            severity: 'LOW',
+            category: 'AI_SLOP_AST',
+            type: 'REDUNDANT_WRAPPER',
+            message: `Function "${name}" is a redundant 1:1 pass-through wrapper around "${retExpr.callee.name}()".`,
+            snippet: getLineText(line)
+          });
+        }
+      }
+    }
   };
 
   try {
     traverse(ast, {
       IfStatement(p) {
-        if (hasIgnoreComment(p.node)) return;
-        if (p.node.test?.type === 'BooleanLiteral' && p.node.test.value === false) {
-          const line = p.node.loc?.start?.line || 1;
+        const line = p.node.loc?.start?.line || 1;
+        const evalRes = p.get('test').evaluate();
+        if (evalRes.confident && !evalRes.value && !isSuppressed(p.node, 'DEAD_CODE_BRANCH')) {
           issues.push({
             file: filePath,
             line,
             severity: 'MEDIUM',
             category: 'AI_SLOP_AST',
             type: 'DEAD_CODE_BRANCH',
-            message: 'Unreachable dead branch "if (false)" left in production code.',
+            message: 'Unreachable constant-falsy "if (...)" dead branch left in code.',
             snippet: getLineText(line)
           });
         }
       },
 
-      CatchClause(p) {
-        if (hasIgnoreComment(p.node)) return;
-        const body = p.node.body?.body || [];
+      WhileStatement(p) {
         const line = p.node.loc?.start?.line || 1;
-
-        if (body.length === 0) {
-          issues.push({
-            file: filePath,
-            line,
-            severity: 'HIGH',
-            category: 'AI_SLOP_AST',
-            type: 'EMPTY_CATCH_BLOCK',
-            message: 'Empty catch {} block silently swallows exceptions. Log, handle, or rethrow the error.',
-            snippet: getLineText(line)
-          });
-          return;
-        }
-
-        if (body.length === 1 && body[0].type === 'ReturnStatement' && isNullishOrBoolLiteral(body[0].argument)) {
+        const evalRes = p.get('test').evaluate();
+        if (evalRes.confident && !evalRes.value && !isSuppressed(p.node, 'DEAD_CODE_BRANCH')) {
           issues.push({
             file: filePath,
             line,
             severity: 'MEDIUM',
             category: 'AI_SLOP_AST',
-            type: 'SILENT_ERROR_MASKING',
-            message: 'Catch block masks failure by silently returning null/undefined/boolean without logging or rethrowing.',
+            type: 'DEAD_CODE_BRANCH',
+            message: 'Unreachable constant-falsy "while (...)" dead loop left in code.',
             snippet: getLineText(line)
           });
         }
       },
 
+      TryStatement(p) {
+        if (p.node.finalizer?.body) {
+          const retStmt = p.node.finalizer.body.find(s => s.type === 'ReturnStatement');
+          if (retStmt && !isSuppressed(p.node.finalizer, 'FINALLY_RETURN_SWALLOW')) {
+            const line = retStmt.loc?.start?.line || p.node.finalizer.loc?.start?.line || 1;
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'AI_SLOP_AST',
+              type: 'FINALLY_RETURN_SWALLOW',
+              message: 'Return statement inside finally {} silently overrides thrown exceptions.',
+              snippet: getLineText(line)
+            });
+          }
+        }
+      },
+
+      CatchClause(p) {
+        const body = p.node.body?.body || [];
+        const line = p.node.loc?.start?.line || 1;
+
+        if (body.length === 0 || body.every(isNoOpStatement)) {
+          if (!isSuppressed(p.node, 'EMPTY_CATCH_BLOCK') && !isSuppressed(p.parentPath.node, 'EMPTY_CATCH_BLOCK')) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'HIGH',
+              category: 'AI_SLOP_AST',
+              type: 'EMPTY_CATCH_BLOCK',
+              message: 'Catch block silently swallows exception (empty, no-op, or log-only without recovery/rethrow).',
+              snippet: getLineText(line)
+            });
+          }
+          return;
+        }
+
+        if (body.length === 1 && body[0].type === 'ReturnStatement' && isNullishOrEmptyLiteral(body[0].argument)) {
+          if (!isSuppressed(p.node, 'SILENT_ERROR_MASKING') && !isSuppressed(p.parentPath.node, 'SILENT_ERROR_MASKING')) {
+            issues.push({
+              file: filePath,
+              line,
+              severity: 'MEDIUM',
+              category: 'AI_SLOP_AST',
+              type: 'SILENT_ERROR_MASKING',
+              message: 'Catch block masks failure by silently returning null/undefined/boolean/empty literal.',
+              snippet: getLineText(line)
+            });
+          }
+        }
+      },
+
       CallExpression(p) {
         const callee = p.node.callee;
-        if (callee?.type === 'MemberExpression' && callee.property?.name === 'catch' && p.node.arguments.length >= 1) {
-          const handler = p.node.arguments[0];
+        if (callee?.type === 'MemberExpression') {
+          const prop = callee.property?.name;
           const line = p.node.loc?.start?.line || 1;
-          if (hasIgnoreComment(p.node)) return;
-          if (handler?.type === 'ArrowFunctionExpression' || handler?.type === 'FunctionExpression') {
-            const isEmptyBlock = handler.body?.type === 'BlockStatement' && handler.body.body.length === 0;
-            const isNullishBlock =
-              handler.body?.type === 'BlockStatement' &&
-              handler.body.body.length === 1 &&
-              handler.body.body[0].type === 'ReturnStatement' &&
-              isNullishOrBoolLiteral(handler.body.body[0].argument);
-            const isNullishConcise = handler.body?.type !== 'BlockStatement' && isNullishOrBoolLiteral(handler.body);
-            if (isEmptyBlock || isNullishBlock || isNullishConcise) {
+          if (prop === 'catch' && p.node.arguments.length >= 1 && isSilentHandlerFn(p.node.arguments[0])) {
+            if (!isSuppressed(p.node, 'SILENT_PROMISE_SWALLOW')) {
               issues.push({
                 file: filePath,
                 line,
                 severity: 'HIGH',
                 category: 'AI_SLOP_AST',
                 type: 'SILENT_PROMISE_SWALLOW',
-                message: 'Promise .catch() silently swallows rejection without handling or logging.',
+                message: 'Promise .catch() silently swallows rejection without handling or rethrowing.',
+                snippet: getLineText(line)
+              });
+            }
+          } else if (prop === 'then' && p.node.arguments.length >= 2 && isSilentHandlerFn(p.node.arguments[1])) {
+            if (!isSuppressed(p.node, 'SILENT_PROMISE_SWALLOW')) {
+              issues.push({
+                file: filePath,
+                line,
+                severity: 'HIGH',
+                category: 'AI_SLOP_AST',
+                type: 'SILENT_PROMISE_SWALLOW',
+                message: 'Promise .then(onFulfilled, onRejected) silently swallows rejection in second handler.',
                 snippet: getLineText(line)
               });
             }
@@ -145,74 +297,39 @@ export function auditAntiSlopAst(code, filePath = 'unknown.ts') {
         }
       },
 
-      VariableDeclarator(p) {
-        if (hasIgnoreComment(p.node)) return;
-        const isExported = p.parentPath?.parentPath?.isExportNamedDeclaration?.();
-        const init = p.node.init;
-        if (
-          isExported &&
-          p.node.id?.type === 'Identifier' &&
-          init &&
-          (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression') &&
-          init.body?.type === 'BlockStatement' &&
-          init.body.body.length === 0
-        ) {
+      ClassMethod(p) {
+        const name = p.node.key?.name || p.node.key?.value;
+        if (p.node.kind === 'constructor' || (name && EXEMPT_STUB_NAMES.test(name))) return;
+        const body = p.node.body?.body || [];
+        if (body.length === 0 && !isSuppressed(p.node, 'EMPTY_STUB_FUNCTION')) {
           const line = p.node.loc?.start?.line || 1;
           issues.push({
             file: filePath,
             line,
-            severity: 'HIGH',
+            severity: 'MEDIUM',
             category: 'AI_SLOP_AST',
             type: 'EMPTY_STUB_FUNCTION',
-            message: `Exported function "${p.node.id.name}" has an empty body (unimplemented stub).`,
+            message: `Class method "${name || 'anonymous'}()" has an empty body (unimplemented stub).`,
             snippet: getLineText(line)
           });
         }
       },
 
+      VariableDeclarator(p) {
+        const isExported = Boolean(p.parentPath?.parentPath?.isExportNamedDeclaration?.());
+        const init = p.node.init;
+        if (
+          p.node.id?.type === 'Identifier' &&
+          init &&
+          (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression')
+        ) {
+          checkWrapperOrStub(p.node.id.name, init, isExported, p.node.loc?.start?.line || 1);
+        }
+      },
+
       FunctionDeclaration(p) {
-        if (hasIgnoreComment(p.node)) return;
-        const name = p.node.id?.name;
-        const body = p.node.body?.body || [];
-        const line = p.node.loc?.start?.line || 1;
-        const isExported = p.parentPath?.isExportNamedDeclaration() || p.parentPath?.isExportDefaultDeclaration();
-
-        if (isExported && body.length === 0) {
-          issues.push({
-            file: filePath,
-            line,
-            severity: 'HIGH',
-            category: 'AI_SLOP_AST',
-            type: 'EMPTY_STUB_FUNCTION',
-            message: `Exported function "${name || 'default'}" has an empty body (unimplemented stub).`,
-            snippet: getLineText(line)
-          });
-          return;
-        }
-
-        // Redundant 1:1 wrapper: function foo(a, b) { return bar(a, b); }
-        if (!isExported && body.length === 1 && body[0].type === 'ReturnStatement' && body[0].argument?.type === 'CallExpression') {
-          const call = body[0].argument;
-          const paramNames = getParamNames(p.node.params);
-          if (
-            paramNames &&
-            paramNames.length > 0 &&
-            call.callee?.type === 'Identifier' &&
-            call.callee.name !== name &&
-            call.arguments.length === paramNames.length &&
-            call.arguments.every((arg, i) => arg.type === 'Identifier' && arg.name === paramNames[i])
-          ) {
-            issues.push({
-              file: filePath,
-              line,
-              severity: 'LOW',
-              category: 'AI_SLOP_AST',
-              type: 'REDUNDANT_WRAPPER',
-              message: `Function "${name}" is a redundant 1:1 pass-through wrapper around "${call.callee.name}()". Call "${call.callee.name}" directly.`,
-              snippet: getLineText(line)
-            });
-          }
-        }
+        const isExported = Boolean(p.parentPath?.isExportNamedDeclaration() || p.parentPath?.isExportDefaultDeclaration());
+        checkWrapperOrStub(p.node.id?.name, p.node, isExported, p.node.loc?.start?.line || 1);
       }
     });
   } catch {

@@ -83,7 +83,7 @@ describe('Aveyx v4 Phase 3 (P2) & Hardened Phase 1+2 Adversarial Suite', () => {
           return null;
         }
 
-        // aveyx-ignore
+        // aveyx-ignore EMPTY_CATCH_BLOCK: intentional fallback for optional legacy probe
         try { intentional(); } catch {}
 
         fetch('/api').catch(() => {});
